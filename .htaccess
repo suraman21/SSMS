@@ -1,0 +1,78 @@
+<FilesMatch "\.(md|txt)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+# ============================================================
+# Security Configuration
+# ============================================================
+
+# Prevent directory browsing
+Options -Indexes
+
+# Deny access to config files
+<FilesMatch "^(config\.php|\.env|\.htaccess|error\.log)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+# Deny access to SQL files
+<FilesMatch "\.(sql|bak|backup|zip)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+# Protect backup directory
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    
+    # Block direct access to backup files
+    RewriteRule ^admin/uploads/backups/ - [F,L]
+    
+    # Block access to cache directory
+    RewriteRule ^admin/uploads/cache/ - [F,L]
+    
+    # Block access to migration files
+    RewriteRule ^admin/migrations/ - [F,L]
+    
+    # Block debug files (CRITICAL: these have hardcoded DB credentials)
+    RewriteRule ^api/v1/debug_ - [F,L]
+    
+    # Block API test console in production
+    RewriteRule ^api/api_test_console\.html$ - [F,L]
+    
+    # Block access to generate_hash.php (temp script)
+    RewriteRule ^admin/backend/generate_hash\.php$ - [F,L]
+</IfModule>
+
+# Security headers
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+</IfModule>
+
+# Compress output for better performance
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css text/javascript application/javascript application/json
+</IfModule>
+
+# Browser caching for static assets
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType image/jpeg "access plus 1 month"
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/gif "access plus 1 month"
+    ExpiresByType image/webp "access plus 1 month"
+    ExpiresByType text/css "access plus 1 week"
+    ExpiresByType application/javascript "access plus 1 week"
+</IfModule>
+
+# php -- BEGIN cPanel-generated handler, do not edit
+# Set the “ea-php82” package as the default “PHP” programming language.
+<IfModule mime_module>
+  AddHandler application/x-httpd-ea-php82 .php .php8 .phtml
+</IfModule>
+# php -- END cPanel-generated handler, do not edit
