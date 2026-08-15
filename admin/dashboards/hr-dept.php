@@ -7,8 +7,8 @@ require_once __DIR__ . '/../backend/calendar_system.php';
 // ------------------------------------------------------------
 // Auth / session context
 // ------------------------------------------------------------
-$userName = (string) ($_SESSION['admin_full_name'] ?? $_SESSION['admin_username'] ?? 'Information Department');
-$userRole = (string) ($_SESSION['admin_role'] ?? 'Information Department');
+$userName = (string) ($_SESSION['admin_full_name'] ?? $_SESSION['admin_username'] ?? 'HR Department');
+$userRole = (string) ($_SESSION['admin_role'] ?? 'HR Department');
 $username = $_SESSION['admin_username'] ?? '';
 
 $today = new DateTime('now', new DateTimeZone('Africa/Addis_Ababa'));
@@ -229,7 +229,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title><?= DEPT_INFO_NAME_EN ?> - <?= SCHOOL_NAME_SHORT_AM ?></title>
+    <title>HR Department - <?= SCHOOL_NAME_SHORT_AM ?></title>
     <?= wbws_calendar_scripts($conn) ?>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     
@@ -510,8 +510,8 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                 <i class="fa-solid fa-id-card-clip text-xl"></i>
             </div>
             <div class="ml-3">
-                <div class="text-sm font-bold amharic-text">Information Department</div>
-                <div class="text-[11px] text-emerald-100 amharic-text"><?= SCHOOL_NAME_SHORT_AM ?> <?= DEPT_INFO_NAME ?></div>
+                <div class="text-sm font-bold amharic-text">HR Department</div>
+                <div class="text-[11px] text-emerald-100 amharic-text"><?= SCHOOL_NAME_SHORT_AM ?> የሰው ሀይል አስተዳደር (HR)</div>
             </div>
         </div>
 
@@ -547,6 +547,22 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                 </span>
                 <span class="font-semibold">Old Members Archive</span>
             </button>
+
+                <button data-section="idcards"
+                        class="mobile-touch-target flex items-center gap-3 px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 transition">
+                    <span class="w-8 h-8 rounded-xl bg-white/15 flex items-center justify-center">
+                        <i class="fa-solid fa-id-card text-sm"></i>
+                    </span>
+                    <span class="font-semibold">ID Cards</span>
+                </button>
+
+            <a href="/admin/groups.php"
+                    class="mobile-touch-target flex items-center gap-3 px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 transition">
+                <span class="w-8 h-8 rounded-xl bg-white/15 flex items-center justify-center">
+                    <i class="fa-solid fa-layer-group text-sm"></i>
+                </span>
+                <span class="font-semibold">Groups</span>
+            </a>
 
 
 
@@ -612,7 +628,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                     <i class="fa-solid fa-circle-info text-lg"></i>
                 </div>
                 <div>
-                    <div class="text-sm font-bold">Information Department</div>
+                    <div class="text-sm font-bold">HR Department</div>
                     <div class="text-[11px] text-emerald-100 amharic-text">á‹¨áˆ˜áˆ¨áŒƒ á‰áŒ¥áŒ¥áˆ­ Â· áˆ˜áˆ˜á‹áŒˆá‰¥ Â· áˆªá–áˆ­á‰µ</div>
                 </div>
             </div>
@@ -634,7 +650,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                         </span>
                         <div>
                             <h1 class="text-base sm:text-lg font-bold amharic-text">
-                                Information Department
+                                HR Department
                             </h1>
                             <p class="text-[11px] sm:text-xs text-emerald-100 amharic-text">
                                 á‹¨áˆ˜áˆ¨áŒƒ á‰áŒ¥áŒ¥áˆ­ Â· á‹¨áŠ á‰£áˆ‹á‰µ áˆ˜áˆ˜á‹áŒˆá‰¥ áŠ¥áŠ“ áˆªá–áˆ­á‰µ
@@ -672,7 +688,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                             <span class="uppercase tracking-wide text-[11px] font-semibold">Dashboard</span>
                         </div>
                         <h2 class="text-lg sm:text-xl font-bold text-slate-800">
-                            Information Department Overview
+                            HR Department Overview
                         </h2>
                     </div>
                     <div class="flex items-center gap-2 text-xs">
@@ -852,7 +868,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                                 <span>Recent Members</span>
                             </h3>
                             <p class="text-[11px] text-slate-500">
-                                Latest registrations handled by the Information Department
+                                Latest registrations handled by the HR Department
                             </p>
                         </div>
                         <button class="hidden sm:inline-flex items-center gap-1 text-[11px] text-emerald-700 hover:text-emerald-900">
@@ -911,11 +927,17 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                             <span>All Members</span>
                         </h3>
                         <p class="text-[11px] text-slate-500">
-                            Full registration and management for Information Department members.
+                            Full registration and management for HR Department members.
                         </p>
                     </div>
                     <div class="flex gap-2">
-                        <!-- Registration moved to HR Dept -->
+                        <button type="button"
+                                onclick="toggleMemberRegistrationForm(true)"
+                                id="toggleMemberFormBtn"
+                                class="mobile-touch-target inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-white text-xs sm:text-sm font-semibold shadow active:scale-95" style="background:linear-gradient(135deg, <?= THEME_PRIMARY ?>, <?= THEME_PRIMARY_LIGHT ?>)">
+                            <i class="fa-solid fa-user-plus text-xs"></i>
+                            <span>Register New Member</span>
+                        </button>
                     </div>
                 </div>
 
@@ -1131,7 +1153,7 @@ $nextMemberCode = isset($conn) ? generate_next_member_code($conn) : '0001';
                 <div id="memberRegistrationWrapper" class="panel p-4 sm:p-5 mobile-card hidden">
                     <form id="memberRegistrationForm"
                           method="post"
-                          action="info_register_member.php"
+                          action="hr_register_member.php"
                           enctype="multipart/form-data"
                           onsubmit="handleMemberFormSubmitWithCheck(event)">
 
@@ -2744,7 +2766,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-[10px] font-semibold text-slate-500 mb-1 uppercase">Department Name (English)</label>
-                                <input type="text" id="deptNameEn" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400" placeholder="Information Department">
+                                <input type="text" id="deptNameEn" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400" placeholder="HR Department">
                             </div>
                             <div>
                                 <label class="block text-[10px] font-semibold text-slate-500 mb-1 uppercase">Department Name (Amharic)</label>
@@ -3597,7 +3619,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const formData = new FormData(form);
         formData.append('csrf_token', CSRF_TOKEN);
 
-        fetch('<?php echo $ajaxPrefix; ?>info_register_member.php', {
+        fetch('<?php echo $ajaxPrefix; ?>hr_register_member.php', {
             method: 'POST',
             body: formData,
             headers: { 'Accept': 'application/json' }
@@ -4564,7 +4586,7 @@ function submitRegistrationForm(formData) {
         formData.append('csrf_token', CSRF_TOKEN);
     }
     
-    fetch('/admin/info_register_member.php', {
+    fetch('/admin/hr_register_member.php', {
         method: 'POST',
         body: formData,
         headers: { 'Accept': 'application/json' }
