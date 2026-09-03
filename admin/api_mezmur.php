@@ -57,8 +57,10 @@ set_exception_handler(static function (\Throwable $e): void {
  * error when the deployment is stale (missing migrations / old code).
  * Bump when the mezmur API contract changes.
  */
-if (!defined('MEZMUR_API_VERSION')) define('MEZMUR_API_VERSION', 'phase6-taxonomy02');
-define('MEZMUR_SCHEMA_MIN', 30); // highest migration the mezmur module relies on
+if (!defined('MEZMUR_API_VERSION')) define('MEZMUR_API_VERSION', 'phase6-taxonomy03');
+// 037 adds singer image storage. Reads remain compatible without it, while
+// ping/schema report the deployment as degraded until the owner runs it.
+if (!defined('MEZMUR_SCHEMA_MIN')) define('MEZMUR_SCHEMA_MIN', 37);
 
 function mezmur_respond(array $payload, int $code = 200): void
 {
@@ -124,12 +126,17 @@ if (!$__rlCheck['allowed']) {
 }
 
 // ── 6. Schema probes (clear message instead of a raw 1054) ────
-try {
-    $probe = $conn->query("SELECT 1 FROM mezmur_hymns LIMIT 0");
-    if ($probe === false) { throw new \RuntimeException('mezmur_hymns missing'); }
-    $probe->close();
-} catch (\Throwable $e) {
-    mezmur_respond(['status' => 'error', 'message' => 'Mezmur tables not found. Ask the administrator to run sql/021_mezmur_department.sql.']);
+// Health/report/reconcile actions must remain usable on a partially
+// migrated deployment; otherwise the very endpoint needed to diagnose the
+// drift is blocked by the drift.
+if (!in_array($action, ['ping', 'schema', 'migrate'], true)) {
+    try {
+        $probe = $conn->query("SELECT 1 FROM mezmur_hymns LIMIT 0");
+        if ($probe === false) { throw new \RuntimeException('mezmur_hymns missing'); }
+        $probe->close();
+    } catch (\Throwable $e) {
+        mezmur_respond(['status' => 'error', 'message' => 'Mezmur tables not found. Ask the administrator to run sql/021_mezmur_department.sql.']);
+    }
 }
 $__attendanceActions = ['days_list', 'day_create', 'sheet', 'save_sheet',
     'analytics_members', 'analytics_sections', 'analytics_trends', 'takers_list',
@@ -162,28 +169,25 @@ try {
         // code version and every mezmur migration are live:
         //   https://…/backend/api/mezmur.php?action=ping
         case 'ping': {
-            $tables = [
-                'mezmur_hymns' => 'sql/021_mezmur_department.sql',
-                'mezmur_days' => 'sql/022_mezmur_attendance.sql',
-                'mezmur_attendance' => 'sql/023_mezmur_date_attendance.sql',
-                'mezmur_attendance_audit' => 'sql/023_mezmur_date_attendance.sql',
-                'mezmur_submissions' => 'sql/024_mezmur_submissions.sql',
-                'mezmur_categories' => 'sql/025_mezmur_hymn_offline.sql',
-                'mezmur_hymn_categories' => 'sql/030_mezmur_taxonomy.sql',
-                'mezmur_zemarians' => 'sql/030_mezmur_taxonomy.sql',
-                'mezmur_hymn_zemarians' => 'sql/030_mezmur_taxonomy.sql',
-            ];
+            // Keep the health check useful precisely when the database is
+            // behind.  The reconciler owns the allow-listed table/column
+            // contract, so this endpoint and action=schema cannot drift
+            // apart again. Its report covers mezmur_hymns, mezmur_days,
+            // mezmur_attendance, mezmur_attendance_audit,
+            // mezmur_submissions, mezmur_categories,
+            // mezmur_hymn_categories, mezmur_zemarians, and
+            // mezmur_hymn_zemarians.
+            $drift = \App\Services\MezmurSchemaReconciler::report($conn);
             $missing = [];
-            foreach ($tables as $tbl => $migration) {
-                try {
-                    $r = $conn->query("SELECT 1 FROM `{$tbl}` LIMIT 0");
-                    if ($r === false) { $missing[$tbl] = $migration; continue; }
-                    $r->close();
-                } catch (\Throwable $e) {
-                    $missing[$tbl] = $migration;
-                }
+            foreach ($drift['missing_tables'] as $tbl => $_missing) {
+                $missing[$tbl] = \App\Services\MezmurSchemaReconciler::migrationHint($tbl);
             }
-            // nullable session_id check (024 block #4)
+            $missingColumns = $drift['missing_columns'];
+            $migrationHints = $drift['migration_hints'] ?? [];
+            $healthy = empty($missing) && empty($missingColumns) && empty($drift['missing_indexes']);
+
+            // Nullable session_id check (024 block #4), retained for old
+            // operators and clients that already consume this field.
             $sessionIdOk = null;
             try {
                 $r = $conn->query("SHOW COLUMNS FROM mezmur_attendance LIKE 'session_id'");
@@ -194,14 +198,19 @@ try {
                 }
             } catch (\Throwable $e) { $sessionIdOk = null; }
             mezmur_respond([
-                'status' => empty($missing) ? 'success' : 'error',
+                'status' => $healthy ? 'success' : 'error',
+                'schema_status' => $healthy ? 'current' : 'degraded',
                 'code_version' => MEZMUR_API_VERSION,
                 'php' => PHP_VERSION,
                 'missing_tables' => $missing,
+                'missing_columns' => $missingColumns,
+                'missing_indexes' => $drift['missing_indexes'],
+                'migration_hints' => $migrationHints,
+                'capabilities' => MezmurHymnService::schemaCapabilities($conn),
                 'session_id_nullable' => $sessionIdOk,
-                'message' => empty($missing)
-                    ? 'Mezmur deployment is current — all tables present.'
-                    : 'Run these migrations on the server: ' . implode(', ', array_values($missing)),
+                'message' => $healthy
+                    ? 'Mezmur deployment is current — all required tables and columns are present.'
+                    : 'Mezmur schema is degraded. Run the listed numbered migrations before enabling the affected features.',
             ]);
         }
 
@@ -275,6 +284,14 @@ try {
             $categoryId = max(0, (int)($_GET['category_id'] ?? 0));
             $zemarianId = max(0, (int)($_GET['zemarian_id'] ?? 0));
 
+            // The singer/category tables may be present while their join
+            // tables are still awaiting sql/030.  Probe capabilities before
+            // composing SQL; a missing table must never be hidden inside an
+            // OR/EXISTS expression that turns the whole list into a 500.
+            $categoryJoinReady = MezmurHymnService::categoryJoinReady($conn);
+            $zemarianJoinReady = MezmurHymnService::zemarianJoinReady($conn);
+            $hasLength = \App\Services\MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'length');
+            $hasLanguage = \App\Services\MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'language');
             $where  = [];
             $types  = '';
             $params = [];
@@ -292,33 +309,67 @@ try {
                 // MZ-4: join-aware name filter (same semantics as
                 // MezmurHymnService::listHymns) — multi-category hymns must
                 // be findable by every label they carry.
-                $where[] = '(category = ? OR EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc ON mc.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND mc.name = ?))';
-                $types .= 'ss';
-                $params[] = mb_substr($category, 0, 50);
-                $params[] = mb_substr($category, 0, 50);
+                if ($categoryJoinReady) {
+                    $where[] = '(category = ? OR EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc ON mc.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND mc.name = ?))';
+                    $types .= 'ss';
+                    $params[] = mb_substr($category, 0, 50);
+                    $params[] = mb_substr($category, 0, 50);
+                } else {
+                    // Legacy category mirror remains searchable without
+                    // making a pre-030 deployment reference missing tables.
+                    $where[] = 'category = ?';
+                    $types .= 's';
+                    $params[] = mb_substr($category, 0, 50);
+                }
             }
             if ($length !== '') {
-                $where[] = 'length = ?';
-                $types .= 's';
-                $params[] = $length;
+                if ($hasLength) {
+                    $where[] = 'length = ?';
+                    $types .= 's';
+                    $params[] = $length;
+                } else {
+                    $where[] = '1=0';
+                }
             }
             if ($language !== '') {
-                $where[] = 'language = ?';
-                $types .= 's';
-                $params[] = $language;
+                if ($hasLanguage) {
+                    $where[] = 'language = ?';
+                    $types .= 's';
+                    $params[] = $language;
+                } else {
+                    $where[] = '1=0';
+                }
             }
             if ($categoryId > 0) {
                 // P30: filtering by a MAIN category rolls up over its subs.
-                $where[] = 'EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc2 ON mc2.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND (mc2.id = ? OR mc2.parent_id = ?))';
-                $types .= 'ii';
-                $params[] = $categoryId;
-                $params[] = $categoryId;
+                if ($categoryJoinReady) {
+                    if (MezmurHymnService::twoLevelReady($conn)) {
+                        $where[] = 'EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc2 ON mc2.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND (mc2.id = ? OR mc2.parent_id = ?))';
+                        $types .= 'ii';
+                        $params[] = $categoryId;
+                        $params[] = $categoryId;
+                    } else {
+                        $where[] = 'EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc WHERE mhc.hymn_id = mezmur_hymns.id AND mhc.category_id = ?)';
+                        $types .= 'i';
+                        $params[] = $categoryId;
+                    }
+                } else {
+                    $where[] = '1=0';
+                }
             }
             if ($zemarianId > 0) {
-                $where[] = 'EXISTS (SELECT 1 FROM mezmur_hymn_zemarians mhz WHERE mhz.hymn_id = mezmur_hymns.id AND mhz.zemarian_id = ?)';
-                $types .= 'i';
-                $params[] = $zemarianId;
+                if ($zemarianJoinReady) {
+                    $where[] = 'EXISTS (SELECT 1 FROM mezmur_hymn_zemarians mhz WHERE mhz.hymn_id = mezmur_hymns.id AND mhz.zemarian_id = ?)';
+                    $types .= 'i';
+                    $params[] = $zemarianId;
+                } else {
+                    $where[] = '1=0';
+                }
             }
+            // The 030 fields are optional while a supported deployment is
+            // being upgraded; the service supplies safe literal fallbacks.
+            $hymnTaxCols = MezmurHymnService::taxonomySelectColumns($conn);
+
             // Snapshot of the STRUCTURAL filters (everything except the
             // text condition) — the fuzzy-rescue pass below reuses them.
             $filterSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
@@ -392,7 +443,7 @@ try {
 
             if ($searchMode === 'word') {
                 $in = implode(',', array_map('intval', $wordIds));
-                $sql = "SELECT id, title, category, length, language, status, updated_at, lyrics,
+                $sql = "SELECT id, title, category, $hymnTaxCols, status, updated_at, lyrics,
                         0 AS score
                         FROM mezmur_hymns
                         WHERE id IN ($in) AND $filterCond
@@ -401,7 +452,7 @@ try {
                 $stmt = $conn->prepare($sql);
                 $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
             } else {
-                $sql = "SELECT id, title, category, length, language, status, updated_at, lyrics,
+                $sql = "SELECT id, title, category, $hymnTaxCols, status, updated_at, lyrics,
                         0 AS score
                         FROM mezmur_hymns $whereSql
                         ORDER BY updated_at DESC, id DESC
@@ -452,7 +503,7 @@ try {
             $rescued = 0;
             if ($search !== '' && $page === 1 && count($items) < $perPage) {
                 $pool = $conn->prepare(
-                    "SELECT id, title, category, length, language, status, updated_at, lyrics, 0 AS score
+                    "SELECT id, title, category, $hymnTaxCols, status, updated_at, lyrics, 0 AS score
                      FROM mezmur_hymns $filterSql
                      ORDER BY updated_at DESC, id DESC
                      LIMIT 500"
@@ -540,7 +591,11 @@ try {
 
         // ── CATEGORIES (canonical list + management) ────────
         case 'categories': {
-            mezmur_respond(['status' => 'success', 'items' => MezmurHymnService::listCategories($conn)]);
+            mezmur_respond([
+                'status' => 'success',
+                'items' => MezmurHymnService::listCategories($conn),
+                'capabilities' => MezmurHymnService::schemaCapabilities($conn)['categories'],
+            ]);
         }
 
         case 'save_category': {
@@ -614,7 +669,11 @@ try {
 
         // ── ZEMARIANS / SINGERS (list + management) ─────────
         case 'zemarians': {
-            mezmur_respond(['status' => 'success', 'items' => MezmurHymnService::listZemarians($conn)]);
+            mezmur_respond([
+                'status' => 'success',
+                'items' => MezmurHymnService::listZemarians($conn),
+                'capabilities' => MezmurHymnService::schemaCapabilities($conn)['zemarians'],
+            ]);
         }
 
         case 'save_zemarian': {
@@ -892,6 +951,16 @@ try {
                     while ($row = $rh->fetch_assoc()) $recentHymns[] = $row;
                 }
             } catch (\Throwable $e) { $recentHymns = []; }
+            // The overview uses the same association reader as list/get so
+            // its compact recent-hymns view cannot silently lose singers.
+            if ($recentHymns) {
+                $ids = array_map(static fn($h) => (int)$h['id'], $recentHymns);
+                $tax = MezmurHymnService::attachTaxonomyBulk($conn, $ids);
+                foreach ($recentHymns as &$rh) {
+                    $rh['zemarians'] = $tax[(int)$rh['id']]['zemarians'] ?? [];
+                }
+                unset($rh);
+            }
 
             mezmur_respond([
                 'status' => 'success',

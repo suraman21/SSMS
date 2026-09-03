@@ -174,10 +174,10 @@ ob_start();
                         <div class="table-shell">
                             <table>
                                 <thead>
-                                    <tr><th>Title</th><th>Category</th><th>Updated</th></tr>
+                                    <tr><th>Title</th><th>Category</th><th>Singers</th><th>Updated</th></tr>
                                 </thead>
                                 <tbody id="mzOvRecentHymns">
-                                    <tr><td colspan="3"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>
+                                    <tr><td colspan="4"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -271,12 +271,13 @@ ob_start();
                                 <tr>
                                     <th>Title</th>
                                     <th>Category</th>
+                                    <th>Singers</th>
                                     <th>Updated</th>
                                     <th class="nowrap">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="mzTbody">
-                                <tr><td colspan="6"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>
+                                <tr><td colspan="5"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -295,6 +296,7 @@ ob_start();
                     <h2><i class="fa-solid fa-tags"></i> Catalog</h2>
                     <div class="page-head-sub">Categories, sub-categories &amp; singers — everything managed here, inline.</div>
                 </div>
+                <div id="mzCatalogNotice" class="mz-banner warn is-hidden" role="status" aria-live="polite"></div>
                 <div class="school-card">
                     <div class="toolbar">
                         <button class="btn-secondary btn-sm mz-cmgr-tab active" id="mzMgrCatTabBtn" onclick="Mezmur.mgrTab('categories')" aria-pressed="true"><i class="fa-solid fa-sitemap"></i> Categories</button>

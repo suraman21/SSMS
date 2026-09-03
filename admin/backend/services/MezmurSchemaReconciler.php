@@ -17,14 +17,21 @@
 
 namespace App\Services;
 
+require_once __DIR__ . '/MezmurSchemaCapabilities.php';
+
 final class MezmurSchemaReconciler
 {
     /** table => column => column DDL (the contract the queries rely on) */
     public const COLUMNS = [
         'mezmur_hymns' => [
+            'title'      => "VARCHAR(255) NOT NULL DEFAULT ''",
             'category'   => "VARCHAR(50) NOT NULL DEFAULT 'general'",
             'lyrics'     => "LONGTEXT DEFAULT NULL",
             'status'     => "ENUM('active','archived') NOT NULL DEFAULT 'active'",
+            // 030: fields used by the taxonomy filters.  These are listed
+            // here so a legacy table cannot make a list request fail.
+            'length'     => "ENUM('long','short') NOT NULL DEFAULT 'long'",
+            'language'   => "ENUM('geez','amharic') NOT NULL DEFAULT 'amharic'",
             'created_by' => "INT UNSIGNED DEFAULT NULL",
             'updated_by' => "INT UNSIGNED DEFAULT NULL",
             'created_at' => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
@@ -34,11 +41,36 @@ final class MezmurSchemaReconciler
         ],
         'mezmur_categories' => [
             'name'       => "VARCHAR(50) NOT NULL",
+            'parent_id'  => "INT UNSIGNED NULL DEFAULT NULL",
+            'image_path' => "VARCHAR(255) NULL DEFAULT NULL",
+            'gradient_start' => "CHAR(9) NULL DEFAULT NULL",
+            'gradient_end' => "CHAR(9) NULL DEFAULT NULL",
             'sort_order' => "INT NOT NULL DEFAULT 0",
             'is_active'  => "TINYINT(1) NOT NULL DEFAULT 1",
             'created_by' => "INT UNSIGNED DEFAULT NULL",
             'created_at' => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
             'updated_at' => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+        ],
+        // 030/037 taxonomy capabilities.  Keeping the join tables in the
+        // same reconciler prevents the classic table-present/column-missing
+        // split-brain deployment.
+        'mezmur_hymn_categories' => [
+            'hymn_id' => "BIGINT UNSIGNED NOT NULL",
+            'category_id' => "INT UNSIGNED NOT NULL",
+        ],
+        'mezmur_zemarians' => [
+            'name' => "VARCHAR(100) NOT NULL",
+            'name_am' => "VARCHAR(100) DEFAULT NULL",
+            'image_path' => "VARCHAR(255) NULL DEFAULT NULL",
+            'sort_order' => "INT NOT NULL DEFAULT 0",
+            'is_active' => "TINYINT(1) NOT NULL DEFAULT 1",
+            'created_by' => "INT UNSIGNED DEFAULT NULL",
+            'created_at' => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            'updated_at' => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+        ],
+        'mezmur_hymn_zemarians' => [
+            'hymn_id' => "BIGINT UNSIGNED NOT NULL",
+            'zemarian_id' => "INT UNSIGNED NOT NULL",
         ],
         'mezmur_days' => [
             'attendance_date' => "DATE DEFAULT NULL",
@@ -93,6 +125,26 @@ final class MezmurSchemaReconciler
      */
     public const INDEXES = [];
 
+    /** Operator-facing source hints for the drift report. */
+    public const MIGRATION_HINTS = [
+        'mezmur_hymns' => 'sql/021_mezmur_department.sql + sql/025_mezmur_hymn_offline.sql + sql/030_mezmur_taxonomy.sql',
+        'mezmur_categories' => 'sql/025_mezmur_hymn_offline.sql + sql/034_mezmur_subcategories.sql + sql/035_mezmur_category_gradient.sql',
+        'mezmur_hymn_categories' => 'sql/030_mezmur_taxonomy.sql',
+        'mezmur_zemarians' => 'sql/030_mezmur_taxonomy.sql',
+        'mezmur_zemarians.image_path' => 'sql/037_zemarian_images.sql',
+        'mezmur_hymn_zemarians' => 'sql/030_mezmur_taxonomy.sql',
+        'mezmur_days' => 'sql/022_mezmur_attendance.sql + sql/023_mezmur_date_attendance.sql',
+        'mezmur_attendance' => 'sql/022_mezmur_attendance.sql + sql/023_mezmur_date_attendance.sql',
+        'mezmur_attendance_audit' => 'sql/023_mezmur_date_attendance.sql',
+        'mezmur_submissions' => 'sql/024_mezmur_submissions.sql',
+    ];
+
+    public static function migrationHint(string $table, ?string $column = null): string
+    {
+        $key = $column === null ? $table : $table . '.' . $column;
+        return self::MIGRATION_HINTS[$key] ?? self::MIGRATION_HINTS[$table] ?? 'the numbered Mezmur SQL migrations';
+    }
+
     /** Minimal CREATE for tables that do not exist at all. */
     private const CREATE = [
         'mezmur_hymns' => "CREATE TABLE `mezmur_hymns` (
@@ -125,10 +177,49 @@ final class MezmurSchemaReconciler
         'mezmur_categories' => "CREATE TABLE `mezmur_categories` (
             `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
             `name` VARCHAR(50) NOT NULL,
+            `parent_id` INT UNSIGNED NULL DEFAULT NULL,
+            `image_path` VARCHAR(255) NULL DEFAULT NULL,
+            `gradient_start` CHAR(9) NULL DEFAULT NULL,
+            `gradient_end` CHAR(9) NULL DEFAULT NULL,
             `sort_order` INT NOT NULL DEFAULT 0,
             `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+            `created_by` INT UNSIGNED DEFAULT NULL,
+            `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
-            UNIQUE KEY `uq_mezmur_categories_name` (`name`)
+            UNIQUE KEY `uq_mc_parent_name` (`parent_id`, `name`),
+            KEY `idx_mc_parent` (`parent_id`),
+            CONSTRAINT `fk_mc_parent` FOREIGN KEY (`parent_id`) REFERENCES `mezmur_categories` (`id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        'mezmur_hymn_categories' => "CREATE TABLE `mezmur_hymn_categories` (
+            `hymn_id` BIGINT UNSIGNED NOT NULL,
+            `category_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`hymn_id`, `category_id`),
+            KEY `idx_mhc_category` (`category_id`),
+            CONSTRAINT `fk_mhc_hymn` FOREIGN KEY (`hymn_id`) REFERENCES `mezmur_hymns` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT `fk_mhc_category` FOREIGN KEY (`category_id`) REFERENCES `mezmur_categories` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        'mezmur_zemarians' => "CREATE TABLE `mezmur_zemarians` (
+            `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name` VARCHAR(100) NOT NULL,
+            `name_am` VARCHAR(100) DEFAULT NULL,
+            `image_path` VARCHAR(255) NULL DEFAULT NULL,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+            `created_by` INT UNSIGNED DEFAULT NULL,
+            `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_mezmur_zemarians_name` (`name`),
+            KEY `idx_mezmur_zemarians_active` (`is_active`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        'mezmur_hymn_zemarians' => "CREATE TABLE `mezmur_hymn_zemarians` (
+            `hymn_id` BIGINT UNSIGNED NOT NULL,
+            `zemarian_id` INT UNSIGNED NOT NULL,
+            PRIMARY KEY (`hymn_id`, `zemarian_id`),
+            KEY `idx_mhz_zemarian` (`zemarian_id`),
+            CONSTRAINT `fk_mhz_hymn` FOREIGN KEY (`hymn_id`) REFERENCES `mezmur_hymns` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT `fk_mhz_zemarian` FOREIGN KEY (`zemarian_id`) REFERENCES `mezmur_zemarians` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
     ];
 
@@ -181,10 +272,20 @@ final class MezmurSchemaReconciler
                 }
             }
         }
+        $migrationHints = [];
+        foreach ($missingTables as $table => $_missing) {
+            $migrationHints[$table] = self::migrationHint($table);
+        }
+        foreach ($missingColumns as $table => $columns) {
+            foreach ($columns as $column) {
+                $migrationHints[$table . '.' . $column] = self::migrationHint($table, $column);
+            }
+        }
         return [
             'missing_tables' => $missingTables,
             'missing_columns' => $missingColumns,
             'missing_indexes' => $missingIndexes,
+            'migration_hints' => $migrationHints,
         ];
     }
 
@@ -372,6 +473,10 @@ final class MezmurSchemaReconciler
             $failed['words:backfill'] = $e->getMessage();
         }
 
+        // DDL may have created a previously absent optional table/column.
+        // Invalidate the per-connection capability snapshot before the
+        // response computes drift_now.
+        MezmurSchemaCapabilities::reset($conn);
         return ['applied' => $applied, 'failed' => $failed];
     }
 }
