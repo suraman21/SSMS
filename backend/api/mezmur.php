@@ -62,6 +62,7 @@ if (isset($_GET['diag'])) {
         'backend/api/mezmur.php',
         'admin/api_mezmur.php',
         'admin/backend/services/MezmurHymnService.php',
+        'admin/backend/services/MezmurSchemaCapabilities.php',
         'admin/backend/services/MezmurAttendanceService.php',
         'admin/backend/services/MezmurSubmissionService.php',
         'admin/backend/services/FeatureGate.php',
@@ -96,6 +97,7 @@ if (isset($_GET['diag'])) {
         'admin/backend/services/MezmurAttendanceService.php' => 'App\\Services\\MezmurAttendanceService',
         'admin/backend/services/MezmurSubmissionService.php' => 'App\\Services\\MezmurSubmissionService',
         'admin/backend/services/MezmurSchemaReconciler.php' => 'App\\Services\\MezmurSchemaReconciler',
+        'admin/backend/services/MezmurSchemaCapabilities.php' => 'App\\Services\\MezmurSchemaCapabilities',
         'admin/backend/services/FeatureGate.php' => 'App\\Services\\FeatureGate',
     );
     $wiring = array();
@@ -151,6 +153,10 @@ if (isset($_GET['diag'])) {
                 'mezmur_attendance'       => 'sql/023',
                 'mezmur_attendance_audit' => 'sql/023',
                 'mezmur_submissions'      => 'sql/024',
+                'mezmur_categories'       => 'sql/025',
+                'mezmur_hymn_categories' => 'sql/030',
+                'mezmur_zemarians'       => 'sql/030',
+                'mezmur_hymn_zemarians'  => 'sql/030',
                 'security_rate_limits'    => 'sql/008',
             );
             $t = array();

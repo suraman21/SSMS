@@ -40,6 +40,9 @@ function apiSendJson(array $response, int $code = 200) {
     // detect a stale server and show an actionable update message.
     if (defined('MEZMUR_API_VERSION') && !isset($response['server_meta'])) {
         $response['server_meta'] = ['mezmur' => MEZMUR_API_VERSION];
+        if (defined('MEZMUR_SCHEMA_MIN')) {
+            $response['server_meta']['schema'] = MEZMUR_SCHEMA_MIN;
+        }
     }
     while (ob_get_level() > 0) {
         @ob_end_clean();

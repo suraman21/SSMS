@@ -23,6 +23,7 @@ namespace App\Services;
 // guarantee — Google's admin-activity model: audit is a property of the
 // writer, not a courtesy of the caller.
 require_once __DIR__ . '/SecurityAuditService.php';
+require_once __DIR__ . '/MezmurSchemaCapabilities.php';
 
 final class MezmurHymnService
 {
@@ -44,6 +45,9 @@ final class MezmurHymnService
     {
         $page = max(1, (int)($filters['page'] ?? 1));
         $perPage = self::clampPerPage((int)($filters['per_page'] ?? 25));
+        if (!self::hymnReadReady($conn)) {
+            return ['items' => [], 'total' => 0, 'page' => 1, 'total_pages' => 1, 'categories' => []];
+        }
         $search = trim((string)($filters['search'] ?? ''));
         // Keystroke hygiene (Telegram/Google parity): single-character
         // queries are ignored server-side too — a '%x%' LIKE scan cannot
@@ -60,9 +64,15 @@ final class MezmurHymnService
             ? (string)($filters['language'] ?? '') : '';
         $categoryId = max(0, (int)($filters['category_id'] ?? 0));
         $zemarianId = max(0, (int)($filters['zemarian_id'] ?? 0));
+        $hasLength = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'length');
+        $hasLanguage = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'language');
 
         // Structural filters only — the text condition is kept SEPARATE so
-        // the fuzzy-rescue pass can reuse the filters without it.
+        // the fuzzy-rescue pass can reuse the filters without it.  Do not
+        // infer join capability from the presence of a singer/category table:
+        // supported deployments can be between migrations 025 and 030.
+        $categoryJoinReady = self::categoryJoinReady($conn);
+        $zemarianJoinReady = self::zemarianJoinReady($conn);
         $where = [];
         $types = '';
         $params = [];
@@ -77,34 +87,72 @@ final class MezmurHymnService
             // only the first one (which is all the legacy mirror string
             // stores). The plain string compare stays for read-backward
             // compatibility ('general' rows carry no join rows).
-            $where[] = "(category = ? OR EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc ON mc.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND mc.name = ?))";
-            $types .= 'ss';
-            $params[] = $category;
-            $params[] = $category;
+            if ($categoryJoinReady) {
+                $where[] = "(category = ? OR EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc ON mc.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND mc.name = ?))";
+                $types .= 'ss';
+                $params[] = $category;
+                $params[] = $category;
+            } else {
+                // Pre-030 deployments still have the legacy mirror string;
+                // never reference a missing join table in an OR branch.
+                $where[] = 'category = ?';
+                $types .= 's';
+                $params[] = $category;
+            }
         }
         if ($length !== '') {
-            $where[] = "length = ?";
-            $types .= 's';
-            $params[] = $length;
+            if ($hasLength) {
+                $where[] = "length = ?";
+                $types .= 's';
+                $params[] = $length;
+            } else {
+                // A requested optional filter cannot be evaluated on a
+                // pre-030 schema; do not silently return unfiltered rows.
+                $where[] = '1=0';
+            }
         }
         if ($language !== '') {
-            $where[] = "language = ?";
-            $types .= 's';
-            $params[] = $language;
+            if ($hasLanguage) {
+                $where[] = "language = ?";
+                $types .= 's';
+                $params[] = $language;
+            } else {
+                $where[] = '1=0';
+            }
         }
         if ($categoryId > 0) {
             // P30 two-level taxonomy: filtering by a MAIN category rolls
             // up — the hymn matches when linked to the category itself
             // OR to any of its sub-categories (indexed join, one level).
-            $where[] = "EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc2 ON mc2.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND (mc2.id = ? OR mc2.parent_id = ?))";
-            $types .= 'ii';
-            $params[] = $categoryId;
-            $params[] = $categoryId;
+            if ($categoryJoinReady) {
+                if (MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', 'parent_id')) {
+                    $where[] = "EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc JOIN mezmur_categories mc2 ON mc2.id = mhc.category_id WHERE mhc.hymn_id = mezmur_hymns.id AND (mc2.id = ? OR mc2.parent_id = ?))";
+                    $types .= 'ii';
+                    $params[] = $categoryId;
+                    $params[] = $categoryId;
+                } else {
+                    // 030 without 034 has no hierarchy yet; exact category
+                    // filtering remains fully supported.
+                    $where[] = "EXISTS (SELECT 1 FROM mezmur_hymn_categories mhc WHERE mhc.hymn_id = mezmur_hymns.id AND mhc.category_id = ?)";
+                    $types .= 'i';
+                    $params[] = $categoryId;
+                }
+            } else {
+                // A numeric canonical filter cannot match without its
+                // association table; return an empty result, not a 1051.
+                $where[] = '1=0';
+            }
         }
         if ($zemarianId > 0) {
-            $where[] = "EXISTS (SELECT 1 FROM mezmur_hymn_zemarians mhz WHERE mhz.hymn_id = mezmur_hymns.id AND mhz.zemarian_id = ?)";
-            $types .= 'i';
-            $params[] = $zemarianId;
+            if ($zemarianJoinReady) {
+                $where[] = "EXISTS (SELECT 1 FROM mezmur_hymn_zemarians mhz WHERE mhz.hymn_id = mezmur_hymns.id AND mhz.zemarian_id = ?)";
+                $types .= 'i';
+                $params[] = $zemarianId;
+            } else {
+                // The filter is authoritative: there are no associations
+                // to match on a pre-030 schema.
+                $where[] = '1=0';
+            }
         }
         $filterSql = $where ? implode(' AND ', $where) : '1=1';
 
@@ -255,7 +303,7 @@ final class MezmurHymnService
      */
     public static function getHymn(\mysqli $conn, int $id): ?array
     {
-        if ($id <= 0) return null;
+        if ($id <= 0 || !self::hymnReadReady($conn)) return null;
         $rev = self::revisionExpr($conn);
         $tax = self::taxonomyCols($conn);
         $stmt = $conn->prepare("SELECT id, title, category, lyrics, status, $rev, $tax, created_at, updated_at FROM mezmur_hymns WHERE id = ?");
@@ -276,38 +324,113 @@ final class MezmurHymnService
     // ─ canonical category management
     // ══════════════════════════════════════════════════════════
 
-    private static ?bool $hasRevisionCache = null;
-
     /** SELECT expression that always yields `revision` even on a stale schema. */
     private static function revisionExpr(\mysqli $conn): string
     {
-        if (self::$hasRevisionCache === null) {
-            $has = false;
-            try {
-                $r = $conn->query("SHOW COLUMNS FROM mezmur_hymns LIKE 'revision'");
-                $has = $r ? (bool)$r->fetch_assoc() : false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $has = false; }
-            self::$hasRevisionCache = $has;
-        }
-        return self::$hasRevisionCache ? 'revision' : '1 AS revision';
+        return MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'revision')
+            ? 'revision' : '1 AS revision';
     }
-
-    private static ?bool $hasTaxonomyCache = null;
 
     /** SELECT fragment for the taxonomy flags, safe on a pre-030 schema. */
     private static function taxonomyCols(\mysqli $conn): string
     {
-        if (self::$hasTaxonomyCache === null) {
-            $has = false;
-            try {
-                $r = $conn->query("SHOW COLUMNS FROM mezmur_hymns LIKE 'length'");
-                $has = $r ? (bool)$r->fetch_assoc() : false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $has = false; }
-            self::$hasTaxonomyCache = $has;
+        $has = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'length')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'language');
+        return $has ? 'length, language' : "'long' AS length, 'amharic' AS language";
+    }
+
+    /** Public for the legacy web list, which shares this compatibility path. */
+    public static function taxonomySelectColumns(\mysqli $conn): string
+    {
+        return self::taxonomyCols($conn);
+    }
+
+    /**
+     * Capability gates shared by the web controller, REST route, and the
+     * service itself.  Table presence alone is not enough: a 030-only or
+     * partially applied deployment may have the catalog but not its joins or
+     * the later image column.
+     */
+    public static function hymnReadReady(\mysqli $conn): bool
+    {
+        if (!MezmurSchemaCapabilities::hasTable($conn, 'mezmur_hymns')) return false;
+        foreach (['id', 'title', 'category', 'lyrics', 'status', 'updated_at'] as $column) {
+            if (!MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', $column)) return false;
         }
-        return self::$hasTaxonomyCache ? 'length, language' : "'long' AS length, 'amharic' AS language";
+        return true;
+    }
+
+    private static function categoryCatalogReady(\mysqli $conn): bool
+    {
+        if (!MezmurSchemaCapabilities::hasTable($conn, 'mezmur_categories')) return false;
+        foreach (['name', 'sort_order', 'is_active', 'created_by', 'updated_at'] as $column) {
+            if (!MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', $column)) return false;
+        }
+        return true;
+    }
+
+    public static function categoryJoinReady(\mysqli $conn): bool
+    {
+        return self::hymnReadReady($conn)
+            && self::categoryCatalogReady($conn)
+            && MezmurSchemaCapabilities::hasTable($conn, 'mezmur_hymn_categories')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_categories', 'hymn_id')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_categories', 'category_id');
+    }
+
+    private static function zemarianCatalogReady(\mysqli $conn): bool
+    {
+        if (!MezmurSchemaCapabilities::hasTable($conn, 'mezmur_zemarians')) return false;
+        foreach (['name', 'name_am', 'sort_order', 'is_active', 'created_by', 'updated_at'] as $column) {
+            if (!MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_zemarians', $column)) return false;
+        }
+        return true;
+    }
+
+    public static function zemarianJoinReady(\mysqli $conn): bool
+    {
+        return self::hymnReadReady($conn)
+            && self::zemarianCatalogReady($conn)
+            && MezmurSchemaCapabilities::hasTable($conn, 'mezmur_hymn_zemarians')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_zemarians', 'hymn_id')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_zemarians', 'zemarian_id');
+    }
+
+    public static function schemaCapabilities(\mysqli $conn): array
+    {
+        return [
+            'hymns' => [
+                'table' => MezmurSchemaCapabilities::hasTable($conn, 'mezmur_hymns'),
+                'read' => self::hymnReadReady($conn),
+                'length' => MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'length'),
+                'language' => MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'language'),
+                'revision' => MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'revision'),
+            ],
+            'categories' => [
+                'table' => MezmurSchemaCapabilities::hasTable($conn, 'mezmur_categories'),
+                'association_table' => self::categoryJoinReady($conn),
+                'image_path' => MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', 'image_path'),
+                'hierarchy' => self::twoLevelReady($conn),
+                'gradient' => self::gradientsReady($conn),
+            ],
+            'zemarians' => [
+                'table' => MezmurSchemaCapabilities::hasTable($conn, 'mezmur_zemarians'),
+                'association_table' => self::zemarianJoinReady($conn),
+                'image_path' => MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_zemarians', 'image_path'),
+            ],
+        ];
+    }
+
+    private static function categoryImageReady(\mysqli $conn): bool
+    {
+        return self::categoriesReady($conn)
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', 'image_path');
+    }
+
+    private static function zemarianImageReady(\mysqli $conn): bool
+    {
+        return MezmurSchemaCapabilities::hasTable($conn, 'mezmur_zemarians')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_zemarians', 'image_path');
     }
 
     /**
@@ -354,22 +477,11 @@ final class MezmurHymnService
     private const WORDS_PER_HYMN = 4000;
     private const WORD_CANDIDATE_CAP = 2000;
 
-    private static ?bool $hasWordsTable = null;
-
     public static function wordsTableReady(\mysqli $conn): bool
     {
-        if (self::$hasWordsTable === null) {
-            $ok = false;
-            try {
-                $r = $conn->query('SELECT 1 FROM mezmur_hymn_words LIMIT 0');
-                $ok = $r !== false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) {
-                $ok = false;
-            }
-            self::$hasWordsTable = $ok;
-        }
-        return self::$hasWordsTable;
+        return MezmurSchemaCapabilities::hasTable($conn, 'mezmur_hymn_words')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_words', 'word')
+            && MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymn_words', 'hymn_id');
     }
 
     /** Lowercased unicode words (letters + digits) — works for any script. */
@@ -474,6 +586,16 @@ final class MezmurHymnService
     private static function isDuplicateKeyValue(\Throwable $e): bool
     {
         return (int)$e->getCode() === 1062 || stripos($e->getMessage(), 'duplicate entry') !== false;
+    }
+
+    /** Bind a dynamic legacy/current column set without trusting identifiers. */
+    private static function bindParams(\mysqli_stmt $stmt, string $types, array $values): void
+    {
+        $refs = [$types];
+        foreach ($values as $key => &$value) {
+            $refs[] =& $value;
+        }
+        $stmt->bind_param(...$refs);
     }
 
     /**
@@ -585,13 +707,44 @@ final class MezmurHymnService
         return $row ? (int)$row['id'] : null;
     }
 
-    /** Public URL of a category cover (cache-busted by mtime). */
+    /**
+     * Public URL of a taxonomy cover (cache-busted by mtime).
+     *
+     * Paths are treated as untrusted database data.  Only the two managed
+     * raster-image directories are exposed; schemes, traversal, control
+     * characters, SVG/HTML, and arbitrary legacy paths become an empty URL.
+     */
     public static function categoryImageUrl(?string $path): string
     {
-        if ($path === null || $path === '') return '';
-        $full = dirname(__DIR__, 3) . '/' . ltrim($path, '/');
+        $path = ltrim(str_replace('\\', '/', trim((string)($path ?? ''))), '/');
+        if ($path === '' || strlen($path) > 255 || preg_match('/[\x00-\x1f\x7f]/', $path)) {
+            return '';
+        }
+        if (!preg_match('#^uploads/mezmur_(?:categories|zemarians)/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:jpe?g|png|webp)$#D', $path)) {
+            return '';
+        }
+        $full = dirname(__DIR__, 3) . '/' . $path;
         $v = @filemtime($full);
-        return '/' . ltrim($path, '/') . ($v !== false ? ('?v=' . $v) : '');
+        return '/' . $path . ($v !== false ? ('?v=' . $v) : '');
+    }
+
+    /** Resolve only a service-generated/managed image path for deletion. */
+    private static function managedTaxonomyImageFile(string $dirName, ?string $path): ?string
+    {
+        if (!in_array($dirName, ['mezmur_categories', 'mezmur_zemarians'], true)) return null;
+        $path = ltrim(str_replace('\\', '/', trim((string)($path ?? ''))), '/');
+        if (!preg_match('#^uploads/' . preg_quote($dirName, '#') . '/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:jpe?g|png|webp)$#D', $path)) {
+            return null;
+        }
+        $root = realpath(dirname(__DIR__, 3));
+        if ($root === false) return null;
+        $full = $root . '/' . $path;
+        $dir = realpath(dirname($full));
+        $uploadRoot = realpath($root . '/uploads');
+        if ($dir === false || $uploadRoot === false) return null;
+        $rootPrefix = rtrim($uploadRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        if (strncmp($dir . DIRECTORY_SEPARATOR, $rootPrefix, strlen($rootPrefix)) !== 0) return null;
+        return $full;
     }
 
     /**
@@ -606,7 +759,7 @@ final class MezmurHymnService
     public static function uploadCategoryImage(\mysqli $conn, int $id, array $file, int $actorId): array
     {
         return self::taxonomyImageStore($conn, 'mezmur_categories', 'mezmur_categories',
-            self::categoriesReady($conn), 'Category tables are not ready.',
+            self::categoryImageReady($conn), 'Category image storage is not ready. Ask the administrator to run sql/034_mezmur_subcategories.sql.',
             $id, $file, $actorId, 'Mezmur Category Image Updated', 'mezmur_category');
     }
 
@@ -614,34 +767,54 @@ final class MezmurHymnService
     public static function uploadZemarianImage(\mysqli $conn, int $id, array $file, int $actorId): array
     {
         return self::taxonomyImageStore($conn, 'mezmur_zemarians', 'mezmur_zemarians',
-            self::zemariansReady($conn), 'Singer tables are not ready.',
+            self::zemarianImageReady($conn), 'Singer image storage is not ready. Ask the administrator to run sql/037_zemarian_images.sql.',
             $id, $file, $actorId, 'Mezmur Singer Image Updated', 'mezmur_zemarian');
     }
 
     private static function taxonomyImageStore(\mysqli $conn, string $table, string $dirName, bool $ready, string $readyMsg, int $id, array $file, int $actorId, string $auditTitle, string $auditTable): array
     {
+        // Callers are internal, but keep the identifier boundary explicit so
+        // a future upload route cannot turn this helper into SQL/path input.
+        $allowed = [
+            'mezmur_categories' => 'mezmur_categories',
+            'mezmur_zemarians' => 'mezmur_zemarians',
+        ];
+        if (!isset($allowed[$table]) || $allowed[$table] !== $dirName) {
+            return ['ok' => false, 'message' => 'Unsupported image target.'];
+        }
         if (!$ready) {
             return ['ok' => false, 'message' => $readyMsg];
         }
         if ($id <= 0) {
-            return ['ok' => false, 'message' => 'Invalid category id.'];
+            return ['ok' => false, 'message' => 'Invalid taxonomy id.'];
         }
-        $stmt = $conn->prepare("SELECT id, image_path FROM " . $table . " WHERE id = ? LIMIT 1");
-        $stmt->bind_param('i', $id);
-        $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
+
+        try {
+            $stmt = $conn->prepare("SELECT id, image_path FROM `" . $table . "` WHERE id = ? LIMIT 1");
+            if (!$stmt) return ['ok' => false, 'message' => 'Unable to read the image target.'];
+            $stmt->bind_param('i', $id);
+            $stmt->execute();
+            $row = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+        } catch (\Throwable $e) {
+            error_log('[mezmur-image] target lookup failed: ' . $e->getMessage());
+            return ['ok' => false, 'message' => 'Unable to read the image target.'];
+        }
         if (!$row) {
             return ['ok' => false, 'message' => 'Row not found.'];
         }
 
-        if (empty($file['tmp_name']) || (int)($file['error'] ?? 1) !== UPLOAD_ERR_OK) {
+        $tmpName = isset($file['tmp_name']) && is_string($file['tmp_name'])
+            ? $file['tmp_name'] : '';
+        $uploadError = filter_var($file['error'] ?? null, FILTER_VALIDATE_INT);
+        if ($tmpName === '' || $uploadError !== UPLOAD_ERR_OK) {
             return ['ok' => false, 'message' => 'Upload failed — please try again.'];
         }
-        if (!is_uploaded_file($file['tmp_name'])) {
+        if (!is_uploaded_file($tmpName)) {
             return ['ok' => false, 'message' => 'Upload failed — invalid transfer.'];
         }
-        $size = (int)($file['size'] ?? 0);
+        $size = filter_var($file['size'] ?? null, FILTER_VALIDATE_INT);
+        $size = $size === false ? 0 : (int)$size;
         if ($size <= 0 || $size > 2 * 1024 * 1024) {
             return ['ok' => false, 'message' => 'Image must be at most 2 MB.'];
         }
@@ -649,65 +822,123 @@ final class MezmurHymnService
         if ($raw === false || strlen($raw) !== $size) {
             return ['ok' => false, 'message' => 'Upload failed — unreadable file.'];
         }
-        $finfo = new \finfo(FILEINFO_MIME_TYPE);
-        $mime = (string)$finfo->buffer($raw);
-        $allow = ['image/jpeg' => 'jpg', 'image/png' => 'png'];
-        if (function_exists('imagewebp')) {
-            $allow['image/webp'] = 'jpg'; // re-encoded to JPEG
-        }
-        if (!isset($allow[$mime])) {
-            return ['ok' => false, 'message' => 'Only JPEG, PNG or WebP images are allowed.'];
-        }
-        $info = @getimagesizefromstring($raw);
-        if ($info === false || (int)$info[0] < 16 || (int)$info[1] < 16 || (int)$info[0] > 4000 || (int)$info[1] > 4000) {
-            return ['ok' => false, 'message' => 'The image dimensions must be between 16×16 and 4000×4000.'];
-        }
-        $img = @imagecreatefromstring($raw);
-        if ($img === false) {
-            return ['ok' => false, 'message' => 'The file is not a valid image.'];
+        if (!class_exists('finfo') || !function_exists('getimagesizefromstring') || !function_exists('imagecreatefromstring')) {
+            error_log('[mezmur-image] image validation extensions are unavailable');
+            return ['ok' => false, 'message' => 'Image processing is unavailable on this server.'];
         }
 
-        // Re-encode: strips EXIF/metadata and any embedded payload.
-        // PNG sources keep PNG (transparency); everything else -> JPEG.
+        try {
+            // Do not trust the browser filename or Content-Type.  finfo,
+            // getimagesize, and a complete decoder must all agree on a
+            // supported raster format before any bytes are stored.
+            $finfo = new \finfo(FILEINFO_MIME_TYPE);
+            $mime = (string)$finfo->buffer($raw);
+            $allow = [
+                'image/jpeg' => 'jpg',
+                'image/png' => 'png',
+            ];
+            if (function_exists('imagecreatefromwebp') && function_exists('imagewebp')) {
+                $allow['image/webp'] = 'jpg'; // always re-encoded to JPEG
+            }
+            if (!isset($allow[$mime])) {
+                return ['ok' => false, 'message' => 'Only JPEG, PNG or WebP images are allowed.'];
+            }
+            $info = @getimagesizefromstring($raw);
+            $width = (int)($info[0] ?? 0);
+            $height = (int)($info[1] ?? 0);
+            $decodedMime = (string)($info['mime'] ?? '');
+            if ($info === false || !isset($allow[$decodedMime]) || $decodedMime !== $mime
+                || $width < 16 || $height < 16 || $width > 4000 || $height > 4000
+                || ((float)$width * (float)$height) > 16000000) {
+                return ['ok' => false, 'message' => 'The image must be a valid raster image between 16×16 and 4000×4000 pixels.'];
+            }
+            $img = @imagecreatefromstring($raw);
+            if ($img === false) {
+                return ['ok' => false, 'message' => 'The file is not a valid image.'];
+            }
+        } catch (\Throwable $e) {
+            error_log('[mezmur-image] image validation failed: ' . $e->getMessage());
+            return ['ok' => false, 'message' => 'The image could not be processed.'];
+        }
+
+        // Re-encode: strips EXIF/metadata and any embedded payload. PNG
+        // sources keep PNG transparency; everything else becomes JPEG.
         $keepPng = $mime === 'image/png';
-        $dir = dirname(__DIR__, 3) . '/uploads/' . $dirName;
+        $root = realpath(dirname(__DIR__, 3));
+        $uploadRoot = $root === false ? false : realpath($root . '/uploads');
+        if ($root === false || $uploadRoot === false || $uploadRoot !== $root . '/uploads') {
+            imagedestroy($img);
+            return ['ok' => false, 'message' => 'Server storage is not available.'];
+        }
+        $dir = $root . '/uploads/' . $dirName;
         if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+            imagedestroy($img);
             return ['ok' => false, 'message' => 'Server storage is not writable.'];
         }
-        // Defense in depth for Apache deployments: the directory serves
-        // images only — never scripts (php -S ignores this; it never
-        // executes uploaded files anyway).
-        $ht = $dir . '/.htaccess';
-        if (!file_exists($ht)) {
-            @file_put_contents($ht, "# Images only - never execute anything from here
-"
-                . "Options -ExecCGI -Indexes\n"
-                . "<FilesMatch \"\\.(php|phtml|phar|cgi|pl|py|sh|htaccess)$\">\n"
-                . "  Require all denied\n</FilesMatch>\n");
+        $realDir = realpath($dir);
+        $dirPrefix = rtrim($uploadRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        if ($realDir === false || strncmp($realDir . DIRECTORY_SEPARATOR, $dirPrefix, strlen($dirPrefix)) !== 0) {
+            imagedestroy($img);
+            return ['ok' => false, 'message' => 'Server storage is not available.'];
         }
-        $name = bin2hex(random_bytes(16)) . ($keepPng ? '.png' : '.jpg');
-        $dest = $dir . '/' . $name;
-        $saved = $keepPng ? imagepng($img, $dest, 6) : imagejpeg($img, $dest, 88);
+
+        // Defense in depth for Apache deployments: the directory serves
+        // images only — never scripts. Fail closed if the policy file cannot
+        // be created on a newly provisioned directory.
+        $ht = $realDir . '/.htaccess';
+        if (!file_exists($ht)) {
+            $policy = "# Images only - never execute anything from here\n"
+                . "Options -ExecCGI -Indexes\n"
+                . "<FilesMatch \"\.(php|phtml|phar|cgi|pl|py|sh|htaccess)$\">\n"
+                . "  Require all denied\n</FilesMatch>\n";
+            if (@file_put_contents($ht, $policy, LOCK_EX) === false) {
+                imagedestroy($img);
+                return ['ok' => false, 'message' => 'Server storage policy could not be applied.'];
+            }
+            @chmod($ht, 0644);
+        }
+
+        try {
+            $name = bin2hex(random_bytes(16)) . ($keepPng ? '.png' : '.jpg');
+        } catch (\Throwable $e) {
+            imagedestroy($img);
+            error_log('[mezmur-image] secure filename generation failed: ' . $e->getMessage());
+            return ['ok' => false, 'message' => 'Unable to create a secure image name.'];
+        }
+        $dest = $realDir . '/' . $name;
+        $saved = $keepPng
+            ? (function_exists('imagepng') && imagepng($img, $dest, 6))
+            : (function_exists('imagejpeg') && imagejpeg($img, $dest, 88));
         imagedestroy($img);
-        if (!$saved) {
+        if (!$saved || !is_file($dest)) {
+            @unlink($dest);
             return ['ok' => false, 'message' => 'Unable to store the image.'];
         }
         @chmod($dest, 0644);
 
         $rel = 'uploads/' . $dirName . '/' . $name;
-        // updated_at bump: the change must reach every device on the
-        // next categories refresh (P33 sync fix).
-        $stmt = $conn->prepare("UPDATE " . $table . " SET image_path = ?, updated_at = NOW() WHERE id = ?");
-        $stmt->bind_param('si', $rel, $id);
-        $ok = $stmt->execute();
-        $stmt->close();
+        // updated_at bump: the change must reach every device on the next
+        // taxonomy refresh (P33 sync fix).
+        try {
+            $stmt = $conn->prepare("UPDATE `" . $table . "` SET image_path = ?, updated_at = NOW() WHERE id = ?");
+            if (!$stmt) throw new \RuntimeException('image reference statement could not be prepared');
+            $stmt->bind_param('si', $rel, $id);
+            $ok = $stmt->execute();
+            $stmt->close();
+        } catch (\Throwable $e) {
+            $ok = false;
+            error_log('[mezmur-image] image reference update failed: ' . $e->getMessage());
+        }
         if (!$ok) {
             @unlink($dest);
             return ['ok' => false, 'message' => 'Unable to save the image reference.'];
         }
-        // Remove the previous cover (best effort).
-        if (!empty($row['image_path']) && $row['image_path'] !== $rel) {
-            @unlink(dirname(__DIR__, 3) . '/' . ltrim((string)$row['image_path'], '/'));
+        // Never concatenate a database path into unlink(): old or corrupted
+        // rows may contain traversal. Only delete a managed path in this
+        // table's own directory; unmanaged legacy files are left for review.
+        $oldFile = self::managedTaxonomyImageFile($dirName, $row['image_path'] ?? null);
+        if ($oldFile !== null && $oldFile !== $dest) {
+            @unlink($oldFile);
         }
         self::audit($conn, $auditTitle, ['file' => $name], $auditTable, $id, $actorId);
         return ['ok' => true, 'image_url' => self::categoryImageUrl($rel), 'message' => 'Image updated.'];
@@ -806,36 +1037,40 @@ final class MezmurHymnService
     public static function attachTaxonomy(\mysqli $conn, int $hymnId): array
     {
         $cats = [];
-        try {
-            $rc = $conn->prepare(
-                "SELECT c.id, c.name FROM mezmur_hymn_categories mhc
-                 JOIN mezmur_categories c ON c.id = mhc.category_id
-                 WHERE mhc.hymn_id = ? ORDER BY c.sort_order, c.name LIMIT 200"
-            );
-            if ($rc) {
-                $rc->bind_param('i', $hymnId);
-                $rc->execute();
-                $res = $rc->get_result();
-                while ($r = $res->fetch_assoc()) { $r['id'] = (int)$r['id']; $cats[] = $r; }
-                $rc->close();
-            }
-        } catch (\Throwable $e) { $cats = []; }
+        if (self::categoryJoinReady($conn)) {
+            try {
+                $rc = $conn->prepare(
+                    "SELECT c.id, c.name FROM mezmur_hymn_categories mhc
+                     JOIN mezmur_categories c ON c.id = mhc.category_id
+                     WHERE mhc.hymn_id = ? ORDER BY c.sort_order, c.name LIMIT 200"
+                );
+                if ($rc) {
+                    $rc->bind_param('i', $hymnId);
+                    $rc->execute();
+                    $res = $rc->get_result();
+                    while ($r = $res->fetch_assoc()) { $r['id'] = (int)$r['id']; $cats[] = $r; }
+                    $rc->close();
+                }
+            } catch (\Throwable $e) { $cats = []; }
+        }
 
         $zem = [];
-        try {
-            $rz = $conn->prepare(
-                "SELECT z.id, z.name, z.name_am FROM mezmur_hymn_zemarians mhz
-                 JOIN mezmur_zemarians z ON z.id = mhz.zemarian_id
-                 WHERE mhz.hymn_id = ? ORDER BY z.sort_order, z.name LIMIT 200"
-            );
-            if ($rz) {
-                $rz->bind_param('i', $hymnId);
-                $rz->execute();
-                $res = $rz->get_result();
-                while ($r = $res->fetch_assoc()) { $r['id'] = (int)$r['id']; $zem[] = $r; }
-                $rz->close();
-            }
-        } catch (\Throwable $e) { $zem = []; }
+        if (self::zemarianJoinReady($conn)) {
+            try {
+                $rz = $conn->prepare(
+                    "SELECT z.id, z.name, z.name_am FROM mezmur_hymn_zemarians mhz
+                     JOIN mezmur_zemarians z ON z.id = mhz.zemarian_id
+                     WHERE mhz.hymn_id = ? ORDER BY z.sort_order, z.name LIMIT 200"
+                );
+                if ($rz) {
+                    $rz->bind_param('i', $hymnId);
+                    $rz->execute();
+                    $res = $rz->get_result();
+                    while ($r = $res->fetch_assoc()) { $r['id'] = (int)$r['id']; $zem[] = $r; }
+                    $rz->close();
+                }
+            } catch (\Throwable $e) { $zem = []; }
+        }
 
         return ['categories' => $cats, 'zemarians' => $zem];
     }
@@ -860,41 +1095,45 @@ final class MezmurHymnService
         $ph = implode(',', array_fill(0, count($ids), '?'));
         $types = str_repeat('i', count($ids));
 
-        try {
-            $stmt = $conn->prepare(
-                "SELECT mhc.hymn_id AS hymn_id, c.id, c.name
-                 FROM mezmur_hymn_categories mhc
-                 JOIN mezmur_categories c ON c.id = mhc.category_id
-                 WHERE mhc.hymn_id IN ($ph) ORDER BY c.sort_order, c.name"
-            );
-            if ($stmt) {
-                $stmt->bind_param($types, ...$ids);
-                $stmt->execute();
-                $res = $stmt->get_result();
-                while ($r = $res->fetch_assoc()) {
-                    $out[(int)$r['hymn_id']]['categories'][] = ['id' => (int)$r['id'], 'name' => (string)$r['name']];
+        if (self::categoryJoinReady($conn)) {
+            try {
+                $stmt = $conn->prepare(
+                    "SELECT mhc.hymn_id AS hymn_id, c.id, c.name
+                     FROM mezmur_hymn_categories mhc
+                     JOIN mezmur_categories c ON c.id = mhc.category_id
+                     WHERE mhc.hymn_id IN ($ph) ORDER BY c.sort_order, c.name"
+                );
+                if ($stmt) {
+                    $stmt->bind_param($types, ...$ids);
+                    $stmt->execute();
+                    $res = $stmt->get_result();
+                    while ($r = $res->fetch_assoc()) {
+                        $out[(int)$r['hymn_id']]['categories'][] = ['id' => (int)$r['id'], 'name' => (string)$r['name']];
+                    }
+                    $stmt->close();
                 }
-                $stmt->close();
-            }
-        } catch (\Throwable $e) { /* pre-030: no join tables */ }
+            } catch (\Throwable $e) { /* partial schema: retain empty associations */ }
+        }
 
-        try {
-            $stmt = $conn->prepare(
-                "SELECT mhz.hymn_id AS hymn_id, z.id, z.name, z.name_am
-                 FROM mezmur_hymn_zemarians mhz
-                 JOIN mezmur_zemarians z ON z.id = mhz.zemarian_id
-                 WHERE mhz.hymn_id IN ($ph) ORDER BY z.sort_order, z.name"
-            );
-            if ($stmt) {
-                $stmt->bind_param($types, ...$ids);
-                $stmt->execute();
-                $res = $stmt->get_result();
-                while ($r = $res->fetch_assoc()) {
-                    $out[(int)$r['hymn_id']]['zemarians'][] = ['id' => (int)$r['id'], 'name' => (string)$r['name'], 'name_am' => $r['name_am']];
+        if (self::zemarianJoinReady($conn)) {
+            try {
+                $stmt = $conn->prepare(
+                    "SELECT mhz.hymn_id AS hymn_id, z.id, z.name, z.name_am
+                     FROM mezmur_hymn_zemarians mhz
+                     JOIN mezmur_zemarians z ON z.id = mhz.zemarian_id
+                     WHERE mhz.hymn_id IN ($ph) ORDER BY z.sort_order, z.name"
+                );
+                if ($stmt) {
+                    $stmt->bind_param($types, ...$ids);
+                    $stmt->execute();
+                    $res = $stmt->get_result();
+                    while ($r = $res->fetch_assoc()) {
+                        $out[(int)$r['hymn_id']]['zemarians'][] = ['id' => (int)$r['id'], 'name' => (string)$r['name'], 'name_am' => $r['name_am']];
+                    }
+                    $stmt->close();
                 }
-                $stmt->close();
-            }
-        } catch (\Throwable $e) { /* pre-030: no join tables */ }
+            } catch (\Throwable $e) { /* partial schema: retain empty associations */ }
+        }
 
         return $out;
     }
@@ -983,6 +1222,9 @@ final class MezmurHymnService
      */
     public static function saveHymn(\mysqli $conn, array $input, int $actorId): array
     {
+        if (!self::hymnReadReady($conn)) {
+            return ['ok' => false, 'message' => 'Hymn storage is not ready. Ask the administrator to run sql/021_mezmur_department.sql.'];
+        }
         $id        = (int)($input['id'] ?? 0);
         $title     = trim((string)($input['title'] ?? ''));
         $category  = trim((string)($input['category'] ?? ''));
@@ -992,6 +1234,13 @@ final class MezmurHymnService
         // clients keep working (no breakage) while nothing persists them.
         $length    = (string)($input['length'] ?? 'long');
         $language  = (string)($input['language'] ?? 'amharic');
+        $hasLength = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'length');
+        $hasLanguage = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'language');
+        $hasRevision = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'revision');
+        $categoryTableReady = self::categoriesReady($conn);
+        $zemarianTableReady = self::zemariansReady($conn);
+        $categoryJoinReady = self::categoryJoinReady($conn);
+        $zemarianJoinReady = self::zemarianJoinReady($conn);
 
         if (!in_array($length, ['long', 'short'], true)) $length = 'long';
         if (!in_array($language, ['geez', 'amharic'], true)) $language = 'amharic';
@@ -1005,6 +1254,20 @@ final class MezmurHymnService
         $zemarianIds = $zemRefs['ids'];
         $pendingCategoryNames = $catRefs['pendingNames'];
         $pendingZemarianNames = $zemRefs['pendingNames'];
+        $hasCategoryRefs = !empty($categoryIds) || !empty($pendingCategoryNames);
+        $hasZemarianRefs = !empty($zemarianIds) || !empty($pendingZemarianNames);
+        if ($hasCategoryRefs && !$categoryTableReady) {
+            return ['ok' => false, 'message' => 'Category support is not ready. Ask the administrator to run sql/030_mezmur_taxonomy.sql.'];
+        }
+        if ($hasCategoryRefs && !$categoryJoinReady) {
+            return ['ok' => false, 'message' => 'Category-to-hymn associations are not ready. Ask the administrator to run sql/030_mezmur_taxonomy.sql.'];
+        }
+        if ($hasZemarianRefs && !$zemarianTableReady) {
+            return ['ok' => false, 'message' => 'Singer support is not ready. Ask the administrator to run sql/030_mezmur_taxonomy.sql.'];
+        }
+        if ($hasZemarianRefs && !$zemarianJoinReady) {
+            return ['ok' => false, 'message' => 'Singer-to-hymn associations are not ready. Ask the administrator to run sql/030_mezmur_taxonomy.sql.'];
+        }
         // Pre-resolve names that already exist server-side (read-only);
         // only genuinely new ones wait for in-transaction creation.
         foreach ($pendingCategoryNames as $k => $n) {
@@ -1037,7 +1300,7 @@ final class MezmurHymnService
         // to leave an orphan category behind whenever the hymn save later
         // failed or rolled back.
         $pendingLegacyCategory = false;
-        if (!$categoryIds && $category !== '' && $category !== 'general' && mb_strlen($category) <= 50) {
+        if ($categoryTableReady && !$categoryIds && $category !== '' && $category !== 'general' && mb_strlen($category) <= 50) {
             $legacyId = self::resolveLegacyCategoryId($conn, $category, false);
             if ($legacyId !== null) {
                 $categoryIds = [$legacyId];
@@ -1048,7 +1311,7 @@ final class MezmurHymnService
 
         // Keep the legacy column in sync for old readers.
         $categoryName = '';
-        if ($categoryIds) {
+        if ($categoryIds && $categoryTableReady) {
             $stmt = $conn->prepare("SELECT name FROM mezmur_categories WHERE id = ? LIMIT 1");
             $stmt->bind_param('i', $categoryIds[0]);
             $stmt->execute();
@@ -1072,7 +1335,7 @@ final class MezmurHymnService
 
         if ($id > 0) {
             $rev = self::revisionExpr($conn);
-            $stmt = $conn->prepare("SELECT id, title, revision, status FROM mezmur_hymns WHERE id = ? LIMIT 1");
+            $stmt = $conn->prepare("SELECT id, title, $rev, status FROM mezmur_hymns WHERE id = ? LIMIT 1");
             $stmt->bind_param('i', $id);
             $stmt->execute();
             $current = $stmt->get_result()->fetch_assoc();
@@ -1129,22 +1392,54 @@ final class MezmurHymnService
                 // check and last-write-won. affected_rows 0 now PROVES the
                 // row moved past us (the UPDATE always bumps revision and
                 // updated_at, so a matching row always counts as changed).
-                if ($baseRevision !== null) {
-                    $stmt = $conn->prepare(
-                        "UPDATE mezmur_hymns
-                         SET title=?, category=?, lyrics=?, length=?, language=?,
-                             updated_by=?, updated_at=NOW(), revision = revision + 1
-                         WHERE id=? AND revision = ?"
-                    );
-                    $stmt->bind_param('sssssiii', $title, $categoryName, $lyrics, $length, $language, $actorId, $id, $baseRevision);
+                if ($hasLength && $hasLanguage && $hasRevision) {
+                    // Keep the current-schema statement explicit: it is the
+                    // hot path and preserves the storage-level optimistic
+                    // concurrency guard used by modern clients.
+                    if ($baseRevision !== null) {
+                        $stmt = $conn->prepare(
+                            "UPDATE mezmur_hymns
+                             SET title=?, category=?, lyrics=?, length=?, language=?,
+                                 updated_by=?, updated_at=NOW(), revision = revision + 1
+                             WHERE id=? AND revision = ?"
+                        );
+                        $stmt->bind_param('sssssiii', $title, $categoryName, $lyrics, $length, $language, $actorId, $id, $baseRevision);
+                    } else {
+                        $stmt = $conn->prepare(
+                            "UPDATE mezmur_hymns
+                             SET title=?, category=?, lyrics=?, length=?, language=?,
+                                 updated_by=?, updated_at=NOW(), revision = revision + 1
+                             WHERE id=?"
+                        );
+                        $stmt->bind_param('sssssii', $title, $categoryName, $lyrics, $length, $language, $actorId, $id);
+                    }
                 } else {
-                    $stmt = $conn->prepare(
-                        "UPDATE mezmur_hymns
-                         SET title=?, category=?, lyrics=?, length=?, language=?,
-                             updated_by=?, updated_at=NOW(), revision = revision + 1
-                         WHERE id=?"
-                    );
-                    $stmt->bind_param('sssssii', $title, $categoryName, $lyrics, $length, $language, $actorId, $id);
+                    // Legacy 021/025 tables can be read while 030 is being
+                    // applied.  Only columns proven present are written; a
+                    // supplied base_revision cannot be enforced until that
+                    // optional column exists.
+                    $set = ['title=?', 'category=?', 'lyrics=?'];
+                    $bindTypes = 'sss';
+                    $bindValues = [$title, $categoryName, $lyrics];
+                    if ($hasLength) {
+                        $set[] = 'length=?';
+                        $bindTypes .= 's';
+                        $bindValues[] = $length;
+                    }
+                    if ($hasLanguage) {
+                        $set[] = 'language=?';
+                        $bindTypes .= 's';
+                        $bindValues[] = $language;
+                    }
+                    $set[] = 'updated_by=?';
+                    $bindTypes .= 'i';
+                    $bindValues[] = $actorId;
+                    $set[] = 'updated_at=NOW()';
+                    $where = 'id=?';
+                    $bindTypes .= 'i';
+                    $bindValues[] = $id;
+                    $stmt = $conn->prepare('UPDATE mezmur_hymns SET ' . implode(', ', $set) . ' WHERE ' . $where);
+                    self::bindParams($stmt, $bindTypes, $bindValues);
                 }
                 $ok = $stmt->execute();
                 $affected = $ok ? $stmt->affected_rows : 0;
@@ -1172,8 +1467,8 @@ final class MezmurHymnService
                         'message' => 'This hymn changed on the server while you were offline. Review the newest copy and save again.',
                     ];
                 }
-                self::syncHymnCategories($conn, $id, $categoryIds);
-                self::syncHymnZemarians($conn, $id, $zemarianIds);
+                if ($categoryJoinReady) self::syncHymnCategories($conn, $id, $categoryIds);
+                if ($zemarianJoinReady) self::syncHymnZemarians($conn, $id, $zemarianIds);
                 self::reindexHymnWords($conn, $id, $title, $lyrics);
                 $conn->commit();
             } catch (\Throwable $e) {
@@ -1225,11 +1520,35 @@ final class MezmurHymnService
             }
             $categoryIds = array_values(array_unique($categoryIds));
             $zemarianIds = array_values(array_unique($zemarianIds));
-            $stmt = $conn->prepare(
-                "INSERT INTO mezmur_hymns (title, category, lyrics, length, language, status, created_by, updated_by)
-                 VALUES (?,?,?,?,?,?,?,?)"
-            );
-            $stmt->bind_param('ssssssii', $title, $categoryName, $lyrics, $length, $language, $status, $actorId, $actorId);
+            if ($hasLength && $hasLanguage) {
+                $stmt = $conn->prepare(
+                    "INSERT INTO mezmur_hymns (title, category, lyrics, length, language, status, created_by, updated_by)
+                     VALUES (?,?,?,?,?,?,?,?)"
+                );
+                $stmt->bind_param('ssssssii', $title, $categoryName, $lyrics, $length, $language, $status, $actorId, $actorId);
+            } else {
+                // 021/025 compatibility: length and language are added by
+                // 030, so an old deployment can still accept a legacy hymn.
+                $fields = ['title', 'category', 'lyrics', 'status', 'created_by', 'updated_by'];
+                $values = [$title, $categoryName, $lyrics, $status, $actorId, $actorId];
+                $types = 'ssssii';
+                if ($hasLength) {
+                    $fields[] = 'length';
+                    $values[] = $length;
+                }
+                if ($hasLanguage) {
+                    $fields[] = 'language';
+                    $values[] = $language;
+                }
+                // Normalize the type string after optional fields are added.
+                $types = '';
+                foreach ($values as $value) $types .= is_int($value) ? 'i' : 's';
+                $stmt = $conn->prepare(
+                    'INSERT INTO mezmur_hymns (' . implode(', ', $fields) . ') VALUES ('
+                    . implode(',', array_fill(0, count($fields), '?')) . ')'
+                );
+                self::bindParams($stmt, $types, $values);
+            }
             $ok = $stmt->execute();
             $newId = $ok ? (int)$stmt->insert_id : 0;
             $dupRace = !$ok && self::isDuplicateKeyError($conn);
@@ -1245,8 +1564,8 @@ final class MezmurHymnService
                 $conn->rollback();
                 return ['ok' => false, 'message' => 'Unable to save the hymn.'];
             }
-            self::syncHymnCategories($conn, $newId, $categoryIds);
-            self::syncHymnZemarians($conn, $newId, $zemarianIds);
+            if ($categoryJoinReady) self::syncHymnCategories($conn, $newId, $categoryIds);
+            if ($zemarianJoinReady) self::syncHymnZemarians($conn, $newId, $zemarianIds);
             self::reindexHymnWords($conn, $newId, $title, $lyrics);
             $conn->commit();
         } catch (\Throwable $e) {
@@ -1277,15 +1596,16 @@ final class MezmurHymnService
         if (!in_array($status, ['active', 'archived'], true)) {
             return ['ok' => false, 'message' => 'Invalid status.'];
         }
-        try {
+        if (MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_hymns', 'revision')) {
             $stmt = $conn->prepare(
                 "UPDATE mezmur_hymns SET status=?, updated_by=?, updated_at=NOW(), revision = revision + 1
                  WHERE id=? AND status <> ?"
             );
-        } catch (\Throwable $e) {
+        } else {
             // Stale schema without revision column: plain status update.
             $stmt = $conn->prepare("UPDATE mezmur_hymns SET status=?, updated_by=?, updated_at=NOW() WHERE id=? AND status <> ?");
         }
+        if (!$stmt) return ['ok' => false, 'message' => 'Unable to update the hymn.'];
         // No-op transitions are refused (affected_rows 0 below): a repeat
         // archive used to "succeed" because the unconditional revision
         // bump made every UPDATE count as changed — burning revisions and
@@ -1316,6 +1636,14 @@ final class MezmurHymnService
      */
     public static function listChangedSince(\mysqli $conn, string $cursor, int $limit = 200, bool $includeLyrics = false): array
     {
+        if (!self::hymnReadReady($conn)) {
+            return [
+                'items' => [],
+                'next_cursor' => trim($cursor),
+                'server_time' => gmdate('Y-m-d H:i:s'),
+                'has_more' => false,
+            ];
+        }
         $limit = max(1, min($limit, $includeLyrics ? 100 : 500));
         $rev = self::revisionExpr($conn);
         $lyricsCol = $includeLyrics ? 'lyrics' : "'' AS lyrics";
@@ -1396,61 +1724,23 @@ final class MezmurHymnService
 
     // ── canonical categories ───────────────────────────────────
 
-    private static ?bool $hasCategoriesCache = null;
-
     private static function categoriesReady(\mysqli $conn): bool
     {
-        if (self::$hasCategoriesCache === null) {
-            $ok = false;
-            try {
-                $r = $conn->query("SELECT 1 FROM mezmur_categories LIMIT 0");
-                $ok = $r !== false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $ok = false; }
-            self::$hasCategoriesCache = $ok;
-        }
-        return self::$hasCategoriesCache;
+        return self::categoryCatalogReady($conn);
     }
 
-    /**
-     * Canonical list (managed in-app). Legacy deployments without the
-     * table degrade to the DISTINCT categories present on hymns.
-     * @return list<array<string,mixed>>
-     */
-    /** P30: does mezmur_categories carry the two-level columns? (Guards
-     *  pre-034 deployments so shipped code never references missing
-     *  columns — the reconciler/admin migrate brings them in.) */
-    private static ?bool $twoLevelCache = null;
-    private static ?bool $gradientsCache = null;
-
-    /** P32: gradient columns probe (sql/035) — absent columns mean
-     *  deployments mid-upgrade keep the automatic palette. */
+    /** P32: both gradient columns are required before either is selected.
+     *  A partially applied 035 migration keeps the automatic palette. */
     public static function gradientsReady(\mysqli $conn): bool
     {
-        if (self::$gradientsCache === null) {
-            $ok = false;
-            try {
-                $r = $conn->query("SHOW COLUMNS FROM mezmur_categories LIKE 'gradient_start'");
-                $ok = $r ? (bool)$r->fetch_assoc() : false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $ok = false; }
-            self::$gradientsCache = $ok;
-        }
-        return self::$gradientsCache;
+        return MezmurSchemaCapabilities::columnLengthAtLeast($conn, 'mezmur_categories', 'gradient_start', 9)
+            && MezmurSchemaCapabilities::columnLengthAtLeast($conn, 'mezmur_categories', 'gradient_end', 9);
     }
 
+    /** P30: hierarchy is optional until sql/034 is applied. */
     public static function twoLevelReady(\mysqli $conn): bool
     {
-        if (self::$twoLevelCache === null) {
-            $ok = false;
-            try {
-                $r = $conn->query("SHOW COLUMNS FROM mezmur_categories LIKE 'parent_id'");
-                $ok = $r ? (bool)$r->fetch_assoc() : false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $ok = false; }
-            self::$twoLevelCache = $ok;
-        }
-        return self::$twoLevelCache;
+        return MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', 'parent_id');
     }
 
     /** Strict #rrggbb or #rrggbbaa hex (P32 + P33 alpha), or NULL. */
@@ -1477,35 +1767,65 @@ final class MezmurHymnService
     public static function removeCategoryImage(\mysqli $conn, int $id, int $actorId): array
     {
         return self::taxonomyImageDrop($conn, 'mezmur_categories', $id, $actorId,
-            'Mezmur Category Image Removed', 'mezmur_category');
+            'Mezmur Category Image Removed', 'mezmur_category', self::categoryImageReady($conn),
+            'Category image storage is not ready. Ask the administrator to run sql/034_mezmur_subcategories.sql.');
     }
 
     /** P34: singers. */
     public static function removeZemarianImage(\mysqli $conn, int $id, int $actorId): array
     {
         return self::taxonomyImageDrop($conn, 'mezmur_zemarians', $id, $actorId,
-            'Mezmur Singer Image Removed', 'mezmur_zemarian');
+            'Mezmur Singer Image Removed', 'mezmur_zemarian', self::zemarianImageReady($conn),
+            'Singer image storage is not ready. Ask the administrator to run sql/037_zemarian_images.sql.');
     }
 
-    private static function taxonomyImageDrop(\mysqli $conn, string $table, int $id, int $actorId, string $auditTitle, string $auditTable): array
+    private static function taxonomyImageDrop(\mysqli $conn, string $table, int $id, int $actorId, string $auditTitle, string $auditTable, bool $ready, string $readyMsg): array
     {
-        if ($id <= 0) return ['ok' => false, 'message' => 'Invalid category id.'];
-        $stmt = $conn->prepare("SELECT image_path FROM " . $table . " WHERE id = ? LIMIT 1");
-        $stmt->bind_param('i', $id);
-        $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
+        $dirs = [
+            'mezmur_categories' => 'mezmur_categories',
+            'mezmur_zemarians' => 'mezmur_zemarians',
+        ];
+        if (!$ready || !isset($dirs[$table])) return ['ok' => false, 'message' => $readyMsg ?: 'Image storage is not ready.'];
+        if ($id <= 0) return ['ok' => false, 'message' => 'Invalid taxonomy id.'];
+        try {
+            $stmt = $conn->prepare("SELECT image_path FROM `" . $table . "` WHERE id = ? LIMIT 1");
+            if (!$stmt) return ['ok' => false, 'message' => 'Unable to read the image target.'];
+            $stmt->bind_param('i', $id);
+            $stmt->execute();
+            $row = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+        } catch (\Throwable $e) {
+            error_log('[mezmur-image] image target lookup failed: ' . $e->getMessage());
+            return ['ok' => false, 'message' => 'Unable to read the image target.'];
+        }
         if (!$row) return ['ok' => false, 'message' => 'Row not found.'];
         if (empty($row['image_path'])) return ['ok' => true, 'message' => 'No cover image set.'];
-        @unlink(dirname(__DIR__, 3) . '/' . ltrim((string)$row['image_path'], '/'));
-        $stmt = $conn->prepare("UPDATE " . $table . " SET image_path = NULL, updated_at = NOW() WHERE id = ?");
-        $stmt->bind_param('i', $id);
-        $stmt->execute();
-        $stmt->close();
+
+        // Clear the reference first. If the database write fails, the old
+        // file remains available; file deletion is strictly best-effort.
+        try {
+            $stmt = $conn->prepare("UPDATE `" . $table . "` SET image_path = NULL, updated_at = NOW() WHERE id = ?");
+            if (!$stmt) throw new \RuntimeException('image reference statement could not be prepared');
+            $stmt->bind_param('i', $id);
+            $ok = $stmt->execute();
+            $stmt->close();
+        } catch (\Throwable $e) {
+            error_log('[mezmur-image] image reference removal failed: ' . $e->getMessage());
+            return ['ok' => false, 'message' => 'Unable to remove the image reference.'];
+        }
+        if (!$ok) return ['ok' => false, 'message' => 'Unable to remove the image reference.'];
+
+        $oldFile = self::managedTaxonomyImageFile($dirs[$table], $row['image_path'] ?? null);
+        if ($oldFile !== null) @unlink($oldFile);
         self::audit($conn, $auditTitle, [], $auditTable, $id, $actorId);
         return ['ok' => true, 'message' => 'Cover image removed — the gradient shows.'];
     }
 
+    /**
+     * Canonical list (managed in-app). Legacy deployments without the
+     * table degrade to the DISTINCT categories present on hymns.
+     * @return list<array<string,mixed>>
+     */
     public static function listCategories(\mysqli $conn): array
     {
         if (self::categoriesReady($conn)) {
@@ -1518,17 +1838,23 @@ final class MezmurHymnService
                 $gradCols = self::gradientsReady($conn)
                     ? 'c.gradient_start, c.gradient_end'
                     : 'NULL AS gradient_start, NULL AS gradient_end';
+                $imageCol = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_categories', 'image_path')
+                    ? 'c.image_path'
+                    : 'NULL AS image_path';
+                $countCols = self::categoryJoinReady($conn)
+                    ? "(SELECT COUNT(*) FROM mezmur_hymn_categories hc
+                         JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
+                         WHERE hc.category_id = c.id) AS hymn_count,
+                        (SELECT COUNT(*) FROM mezmur_hymn_categories hc
+                         JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
+                         JOIN mezmur_categories sc ON sc.id = hc.category_id
+                         WHERE sc.id = c.id OR sc.parent_id = c.id) AS hymn_count_total"
+                    : '0 AS hymn_count, 0 AS hymn_count_total';
                 $res = $conn->query(
-                    "SELECT c.id, c.name, c.parent_id, c.image_path, c.sort_order, c.is_active,
+                    "SELECT c.id, c.name, c.parent_id, $imageCol, c.sort_order, c.is_active,
                             $gradCols,
                             p.name AS parent_name,
-                            (SELECT COUNT(*) FROM mezmur_hymn_categories hc
-                             JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
-                             WHERE hc.category_id = c.id) AS hymn_count,
-                            (SELECT COUNT(*) FROM mezmur_hymn_categories hc
-                             JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
-                             JOIN mezmur_categories sc ON sc.id = hc.category_id
-                             WHERE sc.id = c.id OR sc.parent_id = c.id) AS hymn_count_total
+                            $countCols
                      FROM mezmur_categories c
                      LEFT JOIN mezmur_categories p ON p.id = c.parent_id
                      ORDER BY c.parent_id IS NOT NULL, c.parent_id, c.sort_order, c.name
@@ -1552,11 +1878,13 @@ final class MezmurHymnService
             // P28 (item 11): usage counts for the web catalog manager —
             // how many ACTIVE hymns reference each entry (indexed join,
             // bounded by the LIMIT above).
+            $countCol = self::categoryJoinReady($conn)
+                ? "(SELECT COUNT(*) FROM mezmur_hymn_categories hc
+                     JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
+                     WHERE hc.category_id = c.id) AS hymn_count"
+                : '0 AS hymn_count';
             $res = $conn->query(
-                "SELECT c.id, c.name, c.sort_order, c.is_active,
-                        (SELECT COUNT(*) FROM mezmur_hymn_categories hc
-                         JOIN mezmur_hymns h ON h.id = hc.hymn_id AND h.status = 'active'
-                         WHERE hc.category_id = c.id) AS hymn_count
+                "SELECT c.id, c.name, c.sort_order, c.is_active, $countCol
                  FROM mezmur_categories c ORDER BY c.sort_order, c.name LIMIT 200");
             if ($res) {
                 while ($r = $res->fetch_assoc()) {
@@ -1569,6 +1897,7 @@ final class MezmurHymnService
             }
             return $out;
         }
+        if (!self::hymnReadReady($conn)) return [];
         $out = [];
         $res = $conn->query("SELECT DISTINCT category FROM mezmur_hymns WHERE category <> '' AND category <> 'general' ORDER BY category LIMIT 200");
         if ($res) {
@@ -1756,14 +2085,20 @@ final class MezmurHymnService
         $stmt->close();
         if ($dupRace) {
             // Scoped-unique create race (two devices, same name + parent):
-            // converge to the winner, same as the slow path above.
-            $stmt = $conn->prepare("SELECT id FROM mezmur_categories WHERE LOWER(name) = LOWER(?) AND parent_id <=> ? LIMIT 1");
-            $stmt->bind_param('si', $name, $parentId);
+            // converge to the winner, same as the slow path above.  The
+            // fallback query intentionally avoids parent_id on pre-034 DBs.
+            if ($twoLevel) {
+                $stmt = $conn->prepare("SELECT id FROM mezmur_categories WHERE LOWER(name) = LOWER(?) AND parent_id <=> ? LIMIT 1");
+                $stmt->bind_param('si', $name, $parentId);
+            } else {
+                $stmt = $conn->prepare("SELECT id FROM mezmur_categories WHERE LOWER(name) = LOWER(?) LIMIT 1");
+                $stmt->bind_param('s', $name);
+            }
             $stmt->execute();
             $winner = $stmt->get_result()->fetch_assoc();
             $stmt->close();
             if ($winner) {
-                return ['ok' => true, 'item' => ['id' => (int)$winner['id'], 'name' => $name, 'sort_order' => $sortOrder, 'is_active' => 1, 'parent_id' => $parentId], 'message' => 'Category already exists — linked.'];
+                return ['ok' => true, 'item' => ['id' => (int)$winner['id'], 'name' => $name, 'sort_order' => $sortOrder, 'is_active' => 1, 'parent_id' => $twoLevel ? $parentId : null], 'message' => 'Category already exists — linked.'];
             }
         }
         if (!$ok || $newId <= 0) {
@@ -1797,20 +2132,11 @@ final class MezmurHymnService
 
     // ── zemarians (singers / artists) ─────────────────────────
 
-    private static ?bool $hasZemarianCache = null;
-
+    /** Singer table probe is centralized so it is connection-scoped and
+     *  never confused with the optional image/association capabilities. */
     private static function zemariansReady(\mysqli $conn): bool
     {
-        if (self::$hasZemarianCache === null) {
-            $ok = false;
-            try {
-                $r = $conn->query("SELECT 1 FROM mezmur_zemarians LIMIT 0");
-                $ok = $r !== false;
-                if ($r) { $r->close(); }
-            } catch (\Throwable $e) { $ok = false; }
-            self::$hasZemarianCache = $ok;
-        }
-        return self::$hasZemarianCache;
+        return self::zemarianCatalogReady($conn);
     }
 
     /** @return list<array<string,mixed>> */
@@ -1818,28 +2144,45 @@ final class MezmurHymnService
     {
         if (!self::zemariansReady($conn)) return [];
         $out = [];
-        // P28 (item 11): usage counts for the web catalog manager.
-        $res = $conn->query(
-            "SELECT z.id, z.name, z.name_am, z.image_path, z.sort_order, z.is_active,
-                    (SELECT COUNT(*) FROM mezmur_hymn_zemarians hz
-                     JOIN mezmur_hymns h ON h.id = hz.hymn_id AND h.status = 'active'
-                     WHERE hz.zemarian_id = z.id) AS hymn_count
-             FROM mezmur_zemarians z ORDER BY z.sort_order, z.name LIMIT 500");
-            // LIMIT 500: singers are a small canonical list, fully
-            // refreshed on every device pull and in the dropdowns — the
-            // bound keeps the response bounded if a deployment ever
-            // balloons (audited P36; scale decision, not a leak).
-        if ($res) {
-            while ($r = $res->fetch_assoc()) {
-                $r['id'] = (int)$r['id'];
-                $r['sort_order'] = (int)$r['sort_order'];
-                $r['is_active'] = (int)$r['is_active'];
-                $r['hymn_count'] = (int)$r['hymn_count'];
-                $r['image_url'] = self::categoryImageUrl($r['image_path'] ?? null);
-                unset($r['image_path']);
-                $out[] = $r;
-            }
+        // P28 (item 11): usage counts for the web catalog manager.  The
+        // singer table and its association table are separate capabilities:
+        // a 030-only deployment must still list singers even before the join
+        // table (or migration 037's image column) is available.
+        $imageAndSort = MezmurSchemaCapabilities::hasColumn($conn, 'mezmur_zemarians', 'image_path')
+            ? 'z.image_path, z.sort_order'
+            : 'NULL AS image_path, z.sort_order';
+        $countExpr = self::zemarianJoinReady($conn)
+            ? "(SELECT COUNT(*) FROM mezmur_hymn_zemarians hz
+                 JOIN mezmur_hymns h ON h.id = hz.hymn_id AND h.status = 'active'
+                 WHERE hz.zemarian_id = z.id) AS hymn_count"
+            : '0 AS hymn_count';
+        // LIMIT 500: singers are a small canonical list, fully refreshed on
+        // every device pull and in the dropdowns — the bound keeps the
+        // response bounded if a deployment ever balloons (audited P36).
+        try {
+            $res = $conn->query(
+                "SELECT z.id, z.name, z.name_am, $imageAndSort, z.is_active,
+                        $countExpr
+                 FROM mezmur_zemarians z ORDER BY z.sort_order, z.name LIMIT 500"
+            );
+        } catch (\Throwable $e) {
+            error_log('[mezmur-schema] singer listing failed: ' . $e->getMessage());
+            return [];
         }
+        if ($res === false) {
+            error_log('[mezmur-schema] singer listing returned a database error');
+            return [];
+        }
+        while ($r = $res->fetch_assoc()) {
+            $r['id'] = (int)$r['id'];
+            $r['sort_order'] = (int)$r['sort_order'];
+            $r['is_active'] = (int)$r['is_active'];
+            $r['hymn_count'] = (int)$r['hymn_count'];
+            $r['image_url'] = self::categoryImageUrl($r['image_path'] ?? null);
+            unset($r['image_path']);
+            $out[] = $r;
+        }
+        $res->close();
         return $out;
     }
 
