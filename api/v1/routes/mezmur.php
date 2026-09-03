@@ -20,7 +20,10 @@ $auth = apiRequireAuth();
 // Analytics & day labelling (decision data): mezmur staff + admins only.
 // Version handshake: every /mezmur/* response carries this marker so
 // clients can distinguish a current server from a stale deployment.
-if (!defined('MEZMUR_API_VERSION')) define('MEZMUR_API_VERSION', 'phase6-taxonomy02');
+if (!defined('MEZMUR_API_VERSION')) define('MEZMUR_API_VERSION', 'phase6-taxonomy03');
+// Full taxonomy support is migration 037; readers remain compatible with
+// older databases and expose their capabilities in catalogue responses.
+if (!defined('MEZMUR_SCHEMA_MIN')) define('MEZMUR_SCHEMA_MIN', 37);
 
 // mezmur_attendance_taker = department-owned taker (created by the
 // mezmur console). 'attendance_taker' stays for legacy accounts during
@@ -307,7 +310,10 @@ try {
         if (isApiRateLimited('mezmur_api_read', 480)) {
             err('Too many requests. Please wait a moment.', 429);
         }
-        ok(['items' => MezmurHymnService::listCategories($conn)]);
+        ok([
+            'items' => MezmurHymnService::listCategories($conn),
+            'capabilities' => MezmurHymnService::schemaCapabilities($conn)['categories'],
+        ]);
     }
 
     // ── POST /mezmur/category — create / rename ─────────────────
@@ -417,7 +423,10 @@ try {
         if (isApiRateLimited('mezmur_api_read', 480)) {
             err('Too many requests. Please wait a moment.', 429);
         }
-        ok(['items' => MezmurHymnService::listZemarians($conn)]);
+        ok([
+            'items' => MezmurHymnService::listZemarians($conn),
+            'capabilities' => MezmurHymnService::schemaCapabilities($conn)['zemarians'],
+        ]);
     }
 
     // ── POST /mezmur/zemarian — add / rename a singer ───────────

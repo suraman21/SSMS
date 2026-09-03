@@ -167,16 +167,17 @@
     function staleHint(err) {
         var m = (err && err.message) || '';
         if (/server error|invalid server response|took too long|failed to fetch|network|connection error/i.test(m)) {
-            return ' If this keeps happening, the server backend may be outdated — ask the administrator to pull the latest code and run sql/024_mezmur_submissions.sql.';
+            return ' If this keeps happening, the server backend may be outdated — ask the administrator to pull the latest code and run sql/024_mezmur_submissions.sql plus the newer numbered Mezmur migrations, including sql/037_zemarian_images.sql.';
         }
         return '';
     }
 
     // ── shared state renderers (skeleton / empty / error) ─────
-    function skeletonRows(n) {
+    function skeletonRows(n, columns) {
         var r = '';
+        var colspan = columns || 9;
         for (var i = 0; i < n; i++) {
-            r += '<tr><td colspan="9"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>';
+            r += '<tr><td colspan="' + colspan + '"><div class="skeleton-row"><div class="skeleton"></div><div class="skeleton"></div></div></td></tr>';
         }
         return r;
     }
@@ -301,7 +302,7 @@
             if (d.status !== 'success') {
                 var msg = d.message || 'Unable to load the overview.';
                 $('mzOvRecentDays').innerHTML = '<tr><td colspan="3">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
-                $('mzOvRecentHymns').innerHTML = '<tr><td colspan="3">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
+                $('mzOvRecentHymns').innerHTML = '<tr><td colspan="4">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
                 $('mzOvQueue').innerHTML = '<tr><td colspan="5">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
                 return;
             }
@@ -335,12 +336,13 @@
             var hb = $('mzOvRecentHymns');
             var hymns = d.recent_hymns || [];
             if (!hymns.length) {
-                hb.innerHTML = '<tr><td colspan="3">' + emptyState('fa-music', 'No hymns yet', 'Add the first hymn to start the library.') + '</td></tr>';
+                hb.innerHTML = '<tr><td colspan="4">' + emptyState('fa-music', 'No hymns yet', 'Add the first hymn to start the library.') + '</td></tr>';
             } else {
                 hb.innerHTML = hymns.map(function (h) {
                     return '<tr class="clickable-row" onclick="Mezmur.view(' + h.id + ')" tabindex="0">' +
                         '<td>' + esc(h.title) + '</td>' +
                         '<td>' + (h.category ? '<span class="badge badge-info">' + esc(h.category) + '</span>' : '<span class="text-dim">—</span>') + '</td>' +
+                        '<td>' + zemBadges(h) + '</td>' +
                         '<td class="nowrap text-dim">' + fmtDate(h.updated_at) + '</td></tr>';
                 }).join('');
             }
@@ -363,7 +365,7 @@
         }).catch(function (err) {
             var msg = ((err && err.message) || 'Connection error.') + staleHint(err);
             $('mzOvRecentDays').innerHTML = '<tr><td colspan="3">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
-            $('mzOvRecentHymns').innerHTML = '<tr><td colspan="3">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
+            $('mzOvRecentHymns').innerHTML = '<tr><td colspan="4">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
             $('mzOvQueue').innerHTML = '<tr><td colspan="5">' + errorState(msg, 'Mezmur.loadOverview()') + '</td></tr>';
         });
     }
@@ -459,21 +461,21 @@
             applyList(seq, tb, listCache[q]);
             return;
         }
-        tb.innerHTML = skeletonRows(6);
+        tb.innerHTML = skeletonRows(6, 5);
         apiGet(q).then(function (d) {
             if (seq === lib.seq && d.status === 'success') cachePut(q, d);
             applyList(seq, tb, d);
         }).catch(function (err) {
             if (seq !== lib.seq) return;
             var msg = ((err && err.message) || 'Connection error.') + staleHint(err);
-            tb.innerHTML = '<tr><td colspan="6">' + errorState(msg, 'Mezmur.libReload()') + '</td></tr>';
+            tb.innerHTML = '<tr><td colspan="5">' + errorState(msg, 'Mezmur.libReload()') + '</td></tr>';
         });
     }
 
     function applyList(seq, tb, d) {
         if (seq !== lib.seq) return;
         if (d.status !== 'success') {
-            tb.innerHTML = '<tr><td colspan="6">' + errorState(d.message || 'Unable to load hymns.', 'Mezmur.libReload()') + '</td></tr>';
+            tb.innerHTML = '<tr><td colspan="5">' + errorState(d.message || 'Unable to load hymns.', 'Mezmur.libReload()') + '</td></tr>';
             return;
         }
         lib.totalPages = d.total_pages || 1;
@@ -507,6 +509,16 @@
         return h.category ? '<span class="badge badge-info">' + esc(h.category) + '</span>' : '—';
     }
 
+    /** Render every singer association, not just the first one. */
+    function zemBadges(h) {
+        var zems = (h && h.zemarians) || [];
+        if (!zems.length) return '<span class="text-dim">—</span>';
+        var extra = zems.length > 3 ? ' <span class="text-dim" style="font-size:.7rem">+' + (zems.length - 3) + '</span>' : '';
+        return zems.slice(0, 3).map(function (z) {
+            return '<span class="badge badge-active">' + esc(z.name || z.name_am || '') + '</span>';
+        }).join(' ') + extra;
+    }
+
     /** MZ-12: reset every library filter and reload (empty-state recovery). */
     function clearFilters() {
         lib.search = ''; lib.category = ''; lib.length = ''; lib.language = '';
@@ -524,7 +536,7 @@
             // (Carbon/NNG empty-state pattern: reflect what was applied and
             // offer a recovery action). Every active filter counts.
             var filtered = !!(lib.search || lib.category || lib.length || lib.language || lib.categoryId || lib.zemarianId || lib.status === 'archived');
-            tb.innerHTML = '<tr><td colspan="6">' + (filtered
+            tb.innerHTML = '<tr><td colspan="5">' + (filtered
                 ? emptyState('fa-magnifying-glass', 'No matches', 'No hymns match your current search or filters.',
                     '<button class="btn-secondary btn-sm" onclick="Mezmur.clearFilters()"><i class="fa-solid fa-filter-circle-xmark"></i> Clear filters</button>')
                 : emptyState('fa-music', 'No hymns yet', 'Start the library by adding the first hymn.',
@@ -537,6 +549,7 @@
                 '<td style="padding:.65rem .75rem;font-weight:600;color:var(--school-text-bright)">' + hi(h.title) +
                 (h.snippet ? '<div class="text-dim" style="font-size:.72rem;font-weight:400;margin-top:2px">' + hi(h.snippet) + '</div>' : '') + '</td>' +
                 '<td style="padding:.65rem .75rem">' + catBadges(h) + '</td>' +
+                '<td style="padding:.65rem .75rem">' + zemBadges(h) + '</td>' +
                 '<td style="padding:.65rem .75rem;color:var(--school-text-dim)">' + fmtDate(h.updated_at) + '</td>' +
                 '<td style="padding:.65rem .75rem;text-align:right;white-space:nowrap">' +
                 '<button class="btn-secondary btn-sm" title="View" onclick="Mezmur.view(' + h.id + ')"><i class="fa-solid fa-eye"></i></button> ' +
@@ -570,20 +583,42 @@
      *  the throw was swallowed by an empty catch, so the dropdowns
      *  silently never populated for five patches. Dead calls are now
      *  caught by the behavioral test, not just syntax checks.) */
+    function renderCatalogNotice(messages) {
+        var el = $('mzCatalogNotice');
+        if (!el) return;
+        if (!messages.length) {
+            el.textContent = '';
+            el.classList.add('is-hidden');
+            return;
+        }
+        el.textContent = 'Catalog refresh incomplete: ' + messages.join(' ');
+        el.classList.remove('is-hidden');
+    }
+
+    function catalogRequest(label, query) {
+        return apiGet(query).then(function (d) {
+            if (!d || d.status !== 'success') {
+                throw new Error((d && d.message) || (label + ' list is unavailable.'));
+            }
+            return Array.isArray(d.items) ? d.items : [];
+        });
+    }
+
     function loadCatalog() {
-        var catsP = apiGet('action=categories').then(function (d) {
-            return d && d.status === 'success' ? (d.items || []) : null;
-        });
-        var zemsP = apiGet('action=zemarians').then(function (d) {
-            return d && d.status === 'success' ? (d.items || []) : null;
-        });
+        var catsP = catalogRequest('Category', 'action=categories');
+        var zemsP = catalogRequest('Singer', 'action=zemarians');
         Promise.allSettled([catsP, zemsP]).then(function (res) {
-            if (res[0].status === 'fulfilled' && res[0].value) catalog.categories = res[0].value;
-            if (res[1].status === 'fulfilled' && res[1].value) catalog.zemarians = res[1].value;
+            var warnings = [];
+            if (res[0].status === 'fulfilled') catalog.categories = res[0].value;
+            else warnings.push('Categories: ' + ((res[0].reason && res[0].reason.message) || 'request failed.') + '');
+            if (res[1].status === 'fulfilled') catalog.zemarians = res[1].value;
+            else warnings.push('Singers: ' + ((res[1].reason && res[1].reason.message) || 'request failed.') + '');
+            renderCatalogNotice(warnings);
             renderCatalogBoxes();
             renderFilterSelects();
             if (reconcileFilters()) loadList();
         }).catch(function (e) {
+            renderCatalogNotice(['The catalog could not be refreshed.']);
             console.error('catalog refresh failed', e); // never swallowed silently
         });
     }
@@ -1046,6 +1081,11 @@
     }
     var imgPick = { id: 0, file: null, url: '', kind: 'cat' };
 
+    function resetImagePick() {
+        if (imgPick.url) URL.revokeObjectURL(imgPick.url);
+        imgPick = { id: 0, file: null, url: '', kind: 'cat' };
+    }
+
     function mgrRemoveZemImage(id) {
         sysConfirm('Remove the singer\'s cover image?', function () {
             apiPost({ action: 'zemarian_image_remove', id: id }).then(function (d) {
@@ -1082,15 +1122,19 @@
         el.dataset.p32 = '1';
         $('mzImgUpload').addEventListener('click', function () {
             var file = imgPick.file;
-            if (!file) { closeModalF('mzImageDialog'); return; }
+            if (!file) { resetImagePick(); closeModalF('mzImageDialog'); return; }
             var id = imgPick.id;
+            // Capture the target before clearing dialog state.  Resetting
+            // imgPick first used to route every singer image to the category
+            // action, making the upload appear to succeed but never update a
+            // singer (P34 regression).
+            var action = imgPick.kind === 'zem' ? 'zemarian_image' : 'category_image';
             closeModalF('mzImageDialog');
-            URL.revokeObjectURL(imgPick.url);
-            imgPick = { id: 0, file: null, url: '', kind: 'cat' };
+            resetImagePick();
             mgr.uploading = id;
             renderCatalogManager();
             var fd = new FormData();
-            fd.append('action', imgPick.kind === 'zem' ? 'zemarian_image' : 'category_image');
+            fd.append('action', action);
             fd.append('id', id);
             fd.append('image', file);
             apiPost(fd).then(function (d) {
@@ -1098,11 +1142,14 @@
                 if (d.status !== 'success') { window.toast(d.message || 'Upload failed.', 'e'); renderCatalogManager(); return; }
                 window.toast(d.message || 'Image updated.', 's');
                 loadCatalog();
-            }).catch(function () { mgr.uploading = 0; renderCatalogManager(); });
+            }).catch(function (err) {
+                mgr.uploading = 0;
+                renderCatalogManager();
+                window.toast(((err && err.message) || 'Upload failed.') + staleHint(err), 'e');
+            });
         });
         $('mzImgCancel').addEventListener('click', function () {
-            URL.revokeObjectURL(imgPick.url);
-            imgPick = { id: 0, file: null, url: '', kind: 'cat' };
+            resetImagePick();
             closeModalF('mzImageDialog');
         });
     }
@@ -1480,6 +1527,9 @@
             if (d.status !== 'success' || !d.item) { window.toast(d.message || 'Unable to load this hymn.', 'e'); return; }
             var h = d.item, meta = '';
             if (h.category) meta += '<span class="badge badge-active">' + esc(h.category) + '</span>';
+            if (h.zemarians && h.zemarians.length) {
+                meta += '<span class="text-dim" style="margin-left:.35rem">Singers:</span> ' + zemBadges(h);
+            }
             if (h.status === 'archived') meta += '<span class="badge badge-inactive">Archived</span>';
             $('mzViewTitle').textContent = h.title;
             $('mzViewMeta').innerHTML = meta;
