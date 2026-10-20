@@ -1,3 +1,9 @@
+> # ⚠️ YOU ARE ON THE `dev` BRANCH — FKSS **BETA** (test server)
+> This branch = `main` + one commit that points the **phone app** at
+> `https://felegekidusan.arkeonethiopia.com/api/v1` (package `com.arkeonethiopia.fkss.beta`, name "FKSS Beta").
+> **Never merge this branch into `main`. Never push it to `Felege-Kidusan/felegekidusan`.**
+> Keep it current with `git merge main` (one‑way). Details: `BRANCHING.md` · build: `Mobile/HOW_TO_BUILD_BETA.md`.
+
 # FKSS — Sunday School Management Platform
 
 **A production school-management platform for Felege Kidusan (FKSS/WBWS) Sunday schools** — member management, academics, attendance, reporting, communications, and a Flutter mobile app with offline-first sync.

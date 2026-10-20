@@ -1,3 +1,5 @@
+> **You are on `dev` (FKSS Beta). Do NOT merge this branch into `main`.**
+
 # Instructions for AI coding agents working in this repository
 
 ## ⛔ BRANCH RULE — read first (owner decision 2026‑10‑20, binding)
