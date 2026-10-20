@@ -52,3 +52,32 @@ plus the one beta commit. Never merge the other way.
 - Beta checks `/api/v1/app/config` on the dev server for updates; keep the dev
   server's `.fkss_app_release.php` `latest_build` ≤ the beta build you installed
   (or leave it unset) so it does not nag.
+
+## If the app stays on the splash screen (white screen with the logo)
+
+The native splash is shown until Flutter draws its first frame. Since the
+2026‑10‑20 startup‑watchdog fix the app can no longer stay there silently:
+after at most 40 s it shows **"The app is taking too long to start"** with the
+name of the step that did not answer (`audio_service`, `orientation`,
+`local_database`, `session_bootstrap`, `app_lock`, …). Send that line to the
+agent — it is the root cause.
+
+To capture the real log from a Windows PC (phone with USB debugging on):
+
+```powershell
+adb logcat -c
+adb logcat -v time *:E flutter:V AndroidRuntime:E ActivityManager:I > fkss_launch.txt
+# now open FKSS Beta on the phone, wait 60 s, then press Ctrl+C
+```
+
+Attach `fkss_launch.txt`. Before rebuilding, always:
+
+```powershell
+git checkout dev
+git pull origin dev
+git log -1 --oneline        # must show the newest dev commit
+cd Mobile/wbws_flutter_app
+flutter clean
+flutter pub get
+flutter build apk --release --split-per-abi
+```

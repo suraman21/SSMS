@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -20,6 +21,7 @@ import 'services/crash_log_service.dart';
 import 'services/app_navigator.dart';
 import 'services/mezmur_download_manager.dart';
 import 'services/lyrics_reader_settings.dart';
+import 'utils/config.dart';
 import 'utils/scrolling.dart';
 import 'utils/theme.dart';
 import 'screens/auth/login_screen.dart';
@@ -29,24 +31,119 @@ import 'screens/update/update_screen.dart';
 import 'screens/mezmur/mezmur_mini_player_host.dart';
 import 'screens/profile/sync_center_screen.dart';
 
+// ---------------------------------------------------------------------------
+// Startup watchdog (2026-10-20, "stuck on splash" fix)
+//
+// Everything `main()` awaits BEFORE `runApp` runs behind the native launch
+// splash (`@drawable/launch_background`). If any of those awaits never
+// completes — a plugin platform-channel reply that never arrives, a service
+// binding that never connects, a storage open that blocks — Flutter never
+// draws a first frame, nothing is thrown, nothing is logged, and the user sees
+// the logo forever. The rules below make that impossible:
+//
+//   * every pre-runApp await is a named, time-boxed step;
+//   * optional steps (background audio, orientation) are skipped on timeout;
+//   * required steps (database, session, app lock) fall through to the
+//     existing recovery screen with the step name in the detail line;
+//   * an independent watchdog timer puts a diagnostic screen on screen if the
+//     first `runApp` has still not happened — whatever the reason;
+//   * every stall is appended to `fkss_bootstrap_error.log`, the same file the
+//     native crash trap and Profile → App → Diagnostics use.
+// ---------------------------------------------------------------------------
+
+/// Name of the startup step currently in flight (for the stall screen/log).
+String _startupStep = 'engine';
+
+/// True once the first `runApp` of a real UI happened.
+bool _startupUiShown = false;
+
+Timer? _startupWatchdog;
+
+/// Hard ceiling before the watchdog surfaces the stall screen. Generous
+/// enough for first-launch database creation on a slow phone.
+const Duration _startupWatchdogLimit = Duration(seconds: 40);
+
+class StartupStallException implements Exception {
+  final String step;
+  final Duration limit;
+  const StartupStallException(this.step, this.limit);
+  @override
+  String toString() =>
+      'Startup step "$step" did not finish within ${limit.inSeconds}s';
+}
+
+/// Runs one named startup step with a time limit.
+///
+/// [tolerate] steps are optional: a timeout or error is logged and startup
+/// continues. Required steps rethrow (a timeout as [StartupStallException]) so
+/// `runBootstrap` shows the recovery screen with the step name.
+Future<void> _startupStage(
+  String name,
+  Future<void> Function() body, {
+  required Duration timeout,
+  bool tolerate = false,
+}) async {
+  _startupStep = name;
+  try {
+    await body().timeout(timeout);
+  } on TimeoutException {
+    final error = StartupStallException(name, timeout);
+    await _writeBootstrapLog(error, StackTrace.current);
+    if (!tolerate) throw error;
+  } catch (error, stack) {
+    if (!tolerate) rethrow;
+    await _writeBootstrapLog(error, stack);
+  }
+}
+
+void _armStartupWatchdog() {
+  _startupWatchdog?.cancel();
+  _startupWatchdog = Timer(_startupWatchdogLimit, () {
+    if (_startupUiShown) return;
+    final step = _startupStep;
+    _writeBootstrapLog(
+      StartupStallException(step, _startupWatchdogLimit),
+      StackTrace.current,
+    );
+    runApp(StartupStallApp(step: step));
+  });
+}
+
+void _markStartupUiShown() {
+  _startupUiShown = true;
+  _startupWatchdog?.cancel();
+  _startupWatchdog = null;
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  _armStartupWatchdog();
 
   // P0 background mezmur playback: register the single auto-managed
   // player channel BEFORE runApp so audio_service can connect. Kept
-  // tolerant — on a platform without the plugin the app still starts.
-  try {
-    await JustAudioBackground.init(
+  // tolerant — on a platform without the plugin, or if the service binding
+  // never answers, the app still starts (background audio is then
+  // unavailable until the next launch).
+  await _startupStage(
+    'audio_service',
+    () => JustAudioBackground.init(
       androidNotificationChannelId: 'com.arkeonethiopia.fkss.channel.audio',
       androidNotificationChannelName: 'መዝሙር · FKSS Mezmur',
       androidNotificationOngoing: true,
-    );
-  } catch (_) {}
+    ),
+    timeout: const Duration(seconds: 10),
+    tolerate: true,
+  );
 
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp,
-    DeviceOrientation.portraitDown,
-  ]);
+  await _startupStage(
+    'orientation',
+    () => SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]),
+    timeout: const Duration(seconds: 5),
+    tolerate: true,
+  );
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
@@ -66,15 +163,39 @@ Future<void> runBootstrap() async {
   try {
     // SQLite opens/migrates before credentials are interpreted. The session
     // coordinator then reconciles the durable owner marker, protected
-    // credentials and a single-snapshot local inventory.
-    await LocalDb().database;
-    await SessionCoordinator().bootstrap();
+    // credentials and a single-snapshot local inventory. Each step is
+    // time-boxed: a step that never answers becomes a visible
+    // StartupStallException instead of an endless splash.
+    await _startupStage(
+      'local_database',
+      () async {
+        await LocalDb().database;
+      },
+      timeout: const Duration(seconds: 20),
+    );
+    await _startupStage(
+      'session_bootstrap',
+      () async {
+        await SessionCoordinator().bootstrap();
+      },
+      timeout: const Duration(seconds: 25),
+    );
     // App Lock protects active AND recoverable private state. The PIN is not
     // cleared by auth expiry or preserve-for-reauth logout.
-    await AppLockService().lockAtColdStartIfConfigured();
+    await _startupStage(
+      'app_lock',
+      () => AppLockService().lockAtColdStartIfConfigured(),
+      timeout: const Duration(seconds: 10),
+    );
   } catch (error, stack) {
-    final detail = await _writeBootstrapLog(error, stack);
-    runApp(OfflineDataProtectionFailureApp(detail: detail));
+    final detail = error is StartupStallException
+        ? '$error'
+        : await _writeBootstrapLog(error, stack);
+    _markStartupUiShown();
+    runApp(OfflineDataProtectionFailureApp(
+      detail: detail,
+      stalled: error is StartupStallException,
+    ));
     return;
   }
 
@@ -86,8 +207,11 @@ Future<void> runBootstrap() async {
   // can be granted, and deliberately outside its try/catch: this must never be
   // able to stop the app from starting. It is a no-op on every non-Android
   // host.
+  _startupStep = 'background_sync_producer';
   await installAndroidBackgroundSyncProducer();
 
+  _startupStep = 'first_frame';
+  _markStartupUiShown();
   runApp(const FKSSApp());
 
   WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -143,7 +267,16 @@ Future<String> _writeBootstrapLog(Object error, StackTrace stack) async {
 
 class OfflineDataProtectionFailureApp extends StatefulWidget {
   final String detail;
-  const OfflineDataProtectionFailureApp({super.key, required this.detail});
+
+  /// True when a required startup step timed out (see [StartupStallException])
+  /// rather than failed — the copy then talks about "starting" instead of
+  /// "opening offline storage", because storage may be perfectly healthy.
+  final bool stalled;
+  const OfflineDataProtectionFailureApp({
+    super.key,
+    required this.detail,
+    this.stalled = false,
+  });
 
   @override
   State<OfflineDataProtectionFailureApp> createState() =>
@@ -181,16 +314,24 @@ class _OfflineDataProtectionFailureAppState
                   ),
                   const SizedBox(height: 20),
                   Text(
-                    'Offline storage could not be opened',
+                    widget.stalled
+                        ? 'The app could not finish starting'
+                        : 'Offline storage could not be opened',
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'The app could not open its offline storage on this phone. '
-                    'Your data has NOT been deleted. Free up some phone storage '
-                    'and tap Retry. If it continues, send the detail line below '
-                    'to the school administrator.',
+                    widget.stalled
+                        ? 'One startup step on this phone did not answer in '
+                            'time. Your data has NOT been deleted. Tap Retry; '
+                            'if it continues, restart the phone and send the '
+                            'detail line below to the school administrator '
+                            '(Profile → App → Diagnostics also keeps it).'
+                        : 'The app could not open its offline storage on this phone. '
+                            'Your data has NOT been deleted. Free up some phone storage '
+                            'and tap Retry. If it continues, send the detail line below '
+                            'to the school administrator.',
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 16),
@@ -202,6 +343,85 @@ class _OfflineDataProtectionFailureAppState
                   const SizedBox(height: 12),
                   Text(
                     widget.detail,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown by the startup watchdog when `runApp` has still not happened after
+/// [_startupWatchdogLimit]. It names the step that never answered so the
+/// report from the field is actionable, and lets the user retry without
+/// force-stopping the app. If the stuck step later completes, the normal
+/// `runApp(FKSSApp)` simply replaces this screen.
+class StartupStallApp extends StatefulWidget {
+  final String step;
+  const StartupStallApp({super.key, required this.step});
+
+  @override
+  State<StartupStallApp> createState() => _StartupStallAppState();
+}
+
+class _StartupStallAppState extends State<StartupStallApp> {
+  bool _retrying = false;
+
+  Future<void> _retry() async {
+    setState(() => _retrying = true);
+    // Skip the optional pre-bootstrap stages (audio/orientation): if one of
+    // them is what hung, retrying it would hang again. runBootstrap owns the
+    // required steps and their own timeouts.
+    await runBootstrap(); // replaces this app on success
+    if (mounted) setState(() => _retrying = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: AppConfig.appName,
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.lightTheme,
+      scrollBehavior: const SmoothScrollBehavior(),
+      home: Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.hourglass_bottom_rounded,
+                      size: 56, color: AppTheme.primary),
+                  const SizedBox(height: 20),
+                  const Text(
+                    'The app is taking too long to start',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'A startup step on this phone did not answer. Your data '
+                    'has NOT been deleted. Tap Retry; if it continues, '
+                    'restart the phone and send the detail line below to the '
+                    'school administrator.',
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: _retrying ? null : _retry,
+                    icon: const Icon(Icons.refresh),
+                    label: Text(_retrying ? 'Retrying…' : 'Retry'),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Stuck at startup step: ${widget.step} · '
+                    '${AppConfig.appName} ${AppConfig.appVersion}',
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                   ),
