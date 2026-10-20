@@ -105,6 +105,21 @@ class _LoginScreenState extends State<LoginScreen> {
                   'Spring of Saints Sunday School',
                   style: TextStyle(fontSize: 14, color: AppTheme.textSecondary, fontWeight: FontWeight.w500),
                 ),
+                if (AppConfig.isBeta) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: AppTheme.warning.withOpacity(0.14),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppTheme.warning.withOpacity(0.5)),
+                    ),
+                    child: Text(
+                      'BETA · test server: ${AppConfig.siteOrigin.replaceFirst('https://', '')}',
+                      style: TextStyle(fontSize: 11, color: AppTheme.warning, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ],
 
                 const SizedBox(height: 40),
 

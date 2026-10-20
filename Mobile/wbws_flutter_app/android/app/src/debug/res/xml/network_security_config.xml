@@ -7,6 +7,7 @@
     </base-config>
     <domain-config cleartextTrafficPermitted="false">
         <domain includeSubdomains="true">felegekidusan.com</domain>
+        <domain includeSubdomains="true">arkeonethiopia.com</domain>
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>

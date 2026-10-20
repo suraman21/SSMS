@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 
 /// FKSS App — Configuration Constants
 class AppConfig {
-  static const String apiBaseUrl = 'https://felegekidusan.com/api/v1';
+  // ── FKSS BETA (dev branch only — never merge into main/production) ──
+  // Points at the test server. Production main keeps felegekidusan.com.
+  static const String apiBaseUrl = 'https://felegekidusan.arkeonethiopia.com/api/v1';
+  static const bool isBeta = true;
 
   /// Site root (apiBaseUrl without the /api/v1 suffix) — the origin that
   /// serves RELATIVE upload URLs (category/singer covers, hymn art
@@ -11,7 +14,7 @@ class AppConfig {
   static String get siteOrigin =>
       apiBaseUrl.replaceFirst(RegExp(r'/api/v1$'), '');
 
-  static const String appName = 'FKSS';
+  static const String appName = 'FKSS Beta';
   static const String appNameAmharic = 'ፈለገ ቅዱሳን ሰንበት ት/ቤት';
   // ⚠ SINGLE SOURCE OF TRUTH for the update system: the app compares
   // THESE values against the server's .fkss_app_release.php — pubspec.yaml's
